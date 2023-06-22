@@ -1659,6 +1659,44 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
+    def count_junction(self, read_iterator, splice_site):
+        """Return a dictionary {CellBarcode: {UMIs}}
+        Listing the intronic sites in the reads (identified by 'N' in the cigar strings),
+        and their support ( = number of reads ).
+
+        read_iterator can be the result of a .fetch(...) call.
+        Or it can be a generator filtering such reads. Example
+        samfile.find_introns((read for read in samfile.fetch(...) if read.is_reverse)
+        """
+        cdef:
+            uint32_t base_position, junc_start, nt
+            int op
+            AlignedSegment r
+            int BAM_CREF_SKIP = 3 #BAM_CREF_SKIP
+            bint not_start
+
+        res = collections.defaultdict(set)
+
+        match_or_deletion = {0, 2, 7, 8} # only M/=/X (0/7/8) and D (2) are related to genome position
+        for r in read_iterator:
+            not_start = False
+            base_position = r.pos
+            cigar = r.cigartuples
+            if cigar is None or not r.has_tag('CB') or not r.has_tag('UB'):
+                continue
+
+            for op, nt in cigar:
+                if op in match_or_deletion:
+                    base_position += nt
+                    not_start = True
+                elif op == BAM_CREF_SKIP and not_start:
+                    junc_start = base_position
+                    base_position += nt
+                    if base_position == splice_site:
+                        res[r.get_tag('CB')].add(r.get_tag('UB'))
+        return res
+
+
     def close(self):
         '''closes the :class:`pysam.AlignmentFile`.'''
 

@@ -1659,7 +1659,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, splice_site):
+    def count_junction(self, read_iterator, splice_site, forward_strand):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the intronic sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1682,8 +1682,13 @@ cdef class AlignmentFile(HTSFile):
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag('CB') or not r.has_tag('UB'):
+            if cigar is None or not r.has_tag('CB') or not r.has_tag('UB') or r.is_secondary or (forward_strand == r.is_reverse):
                 continue
+
+            #handle different strand orientation. only for positively stranded case
+            if not forward_strand:
+                cigar = list(map(lambda op, nt: (op, -nt), reversed(cigar)))
+                base_position += r.infer_query_length()
 
             for op, nt in cigar:
                 if op in match_or_deletion:

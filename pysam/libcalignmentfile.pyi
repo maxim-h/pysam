@@ -164,7 +164,8 @@ class AlignmentFile(HTSFile):
     def count_junction(
         self,
         read_iterator: Iterable[AlignedSegment],
-        splice_site: int
+        splice_site: int,
+        forward_strand: bool
     ) -> Dict[str, set]: ...
     def close(self) -> None: ...
     def write(self, read: AlignedSegment) -> int: ...

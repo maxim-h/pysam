@@ -1687,7 +1687,7 @@ cdef class AlignmentFile(HTSFile):
 
             #handle different strand orientation. only for positively stranded case
             if not forward_strand:
-                cigar = list(map(lambda op, nt: (op, -nt), reversed(cigar)))
+                cigar = list(map(lambda st: (st[0], -st[1]), reversed(cigar)))
                 base_position += r.infer_query_length()
 
             for op, nt in cigar:

@@ -1669,7 +1669,7 @@ cdef class AlignmentFile(HTSFile):
         samfile.find_introns((read for read in samfile.fetch(...) if read.is_reverse)
         """
         cdef:
-            uint32_t base_position, junc_start, nt
+            int32_t base_position, junc_start, nt
             int op
             AlignedSegment r
             int BAM_CREF_SKIP = 3 #BAM_CREF_SKIP
@@ -1694,10 +1694,16 @@ cdef class AlignmentFile(HTSFile):
                 if op in match_or_deletion:
                     base_position += nt
                     not_start = True
+                    # this will happen if we go in reverse
+                    if base_position == splice_site:
+                        assert not forward_strand
+                        res[r.get_tag('CB')].add(r.get_tag('UB'))
                 elif op == BAM_CREF_SKIP and not_start:
                     junc_start = base_position
                     base_position += nt
+                    # this will happen if we go forward
                     if base_position == splice_site:
+                        assert forward_strand
                         res[r.get_tag('CB')].add(r.get_tag('UB'))
         return res
 

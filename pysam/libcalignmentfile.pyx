@@ -1696,14 +1696,18 @@ cdef class AlignmentFile(HTSFile):
                     not_start = True
                     # this will happen if we go in reverse
                     if base_position == splice_site:
-                        assert not forward_strand
+                        # this occurs when a 5' splice site is present at the
+                        # exact position where a 3' splice site shoule be
+                        if forward_strand:
+                            pass
                         res[r.get_tag('CB')].add(r.get_tag('UB'))
                 elif op == BAM_CREF_SKIP and not_start:
                     junc_start = base_position
                     base_position += nt
                     # this will happen if we go forward
                     if base_position == splice_site:
-                        assert forward_strand
+                        if not forward_strand:
+                            pass
                         res[r.get_tag('CB')].add(r.get_tag('UB'))
         return res
 

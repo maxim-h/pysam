@@ -1659,7 +1659,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, splice_site, forward_strand):
+    def count_junction(self, read_iterator, splice_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the intronic sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1682,7 +1682,7 @@ cdef class AlignmentFile(HTSFile):
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag('CB') or not r.has_tag('UB') or r.is_secondary or (forward_strand == r.is_reverse):
+            if cigar is None or not r.has_tag(sam_options['CB']) or not r.has_tag(sam_options['UMI']) or r.is_secondary or (forward_strand == r.is_reverse):
                 continue
 
             #handle different strand orientation. only for positively stranded case
@@ -1700,7 +1700,7 @@ cdef class AlignmentFile(HTSFile):
                         # exact position where a 3' splice site shoule be
                         if forward_strand:
                             pass
-                        res[r.get_tag('CB')].add(r.get_tag('UB'))
+                        res[r.get_tag(sam_options['CB'])].add(r.get_tag(sam_options['UMI']))
                 elif op == BAM_CREF_SKIP and not_start:
                     junc_start = base_position
                     base_position += nt
@@ -1708,7 +1708,7 @@ cdef class AlignmentFile(HTSFile):
                     if base_position == splice_site:
                         if not forward_strand:
                             pass
-                        res[r.get_tag('CB')].add(r.get_tag('UB'))
+                        res[r.get_tag(sam_options['CB'])].add(r.get_tag(sam_options['UMI']))
         return res
 
 

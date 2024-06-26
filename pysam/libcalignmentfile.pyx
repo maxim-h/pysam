@@ -1677,13 +1677,21 @@ cdef class AlignmentFile(HTSFile):
 
         res = collections.defaultdict(set)
 
+        un = 0
+
         match_or_deletion = {0, 2, 7, 8} # only M/=/X (0/7/8) and D (2) are related to genome position
         for r in read_iterator:
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag(sam_options['CB']) or not r.has_tag(sam_options['UMI']) or r.is_secondary or (forward_strand == r.is_reverse):
+            if cigar is None or not r.has_tag(sam_options['CB']) or (sam_options['UMI'] is not None and not r.has_tag(sam_options['UMI'])) or r.is_secondary or (forward_strand == r.is_reverse):
                 continue
+
+            if sam_options['UMI'] is None:
+                umi = un
+                un += 1
+            else:
+                umi = r.get_tag(sam_options['UMI'])
 
             #handle different strand orientation. only for positively stranded case
             if not forward_strand:
@@ -1700,7 +1708,7 @@ cdef class AlignmentFile(HTSFile):
                         # exact position where a 3' splice site shoule be
                         if forward_strand:
                             pass
-                        res[r.get_tag(sam_options['CB'])].add(r.get_tag(sam_options['UMI']))
+                        res[r.get_tag(sam_options['CB'])].add(umi)
                 elif op == BAM_CREF_SKIP and not_start:
                     junc_start = base_position
                     base_position += nt
@@ -1708,7 +1716,7 @@ cdef class AlignmentFile(HTSFile):
                     if base_position == splice_site:
                         if not forward_strand:
                             pass
-                        res[r.get_tag(sam_options['CB'])].add(r.get_tag(sam_options['UMI']))
+                        res[r.get_tag(sam_options['CB'])].add(umi)
         return res
 
 

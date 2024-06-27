@@ -1684,7 +1684,7 @@ cdef class AlignmentFile(HTSFile):
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag(sam_options['CB']) or (sam_options['UMI'] is not None and not r.has_tag(sam_options['UMI'])) or r.is_secondary or (forward_strand == r.is_reverse):
+            if cigar is None or not r.has_tag(sam_options['CB']) or ((sam_options['UMI'] is not None) and (not r.has_tag(sam_options['UMI']))) or r.is_secondary or (forward_strand == r.is_reverse):
                 continue
 
             if sam_options['UMI'] is None:

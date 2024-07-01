@@ -1661,7 +1661,7 @@ cdef class AlignmentFile(HTSFile):
 
     def count_junction(self, read_iterator, splice_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}):
         """Return a dictionary {CellBarcode: {UMIs}}
-        Listing the intronic sites in the reads (identified by 'N' in the cigar strings),
+        Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
 
         read_iterator can be the result of a .fetch(...) call.
@@ -1674,6 +1674,7 @@ cdef class AlignmentFile(HTSFile):
             AlignedSegment r
             int BAM_CREF_SKIP = 3 #BAM_CREF_SKIP
             bint not_start
+            bint cref_skip_minus_strand_previous
 
         res = collections.defaultdict(set)
 
@@ -1698,25 +1699,34 @@ cdef class AlignmentFile(HTSFile):
                 cigar = list(map(lambda st: (st[0], -st[1]), reversed(cigar)))
                 base_position += r.infer_query_length()
 
+            cref_skip_minus_strand_previous = False
+
             for op, nt in cigar:
                 if op in match_or_deletion:
                     base_position += nt
                     not_start = True
                     # this will happen if we go in reverse
                     if base_position == splice_site:
-                        # this occurs when a 5' splice site is present at the
-                        # exact position where a 3' splice site shoule be
-                        if forward_strand:
-                            pass
-                        res[r.get_tag(sam_options['CB'])].add(umi)
+                        # this check is for when a 5' splice site is present
+                        # at the exact position where a 3' splice site shoule be
+                        if not forward_strand:
+                            # Will add the UMI, but only if on the next iteration
+                            # we see BAM_CREF_SKIP
+                            cref_skip_minus_strand_previous = True
                 elif op == BAM_CREF_SKIP and not_start:
-                    junc_start = base_position
+                    if cref_skip_minus_strand_previous:
+                        res[r.get_tag(sam_options['CB'])].add(umi)
+                        cref_skip_minus_strand_previous = False
+                        continue
+                    #junc_start = base_position
                     base_position += nt
                     # this will happen if we go forward
                     if base_position == splice_site:
                         if not forward_strand:
-                            pass
+                            cref_skip_minus_strand_previous = False
+                            continue
                         res[r.get_tag(sam_options['CB'])].add(umi)
+                    cref_skip_minus_strand_previous = False
         return res
 
 

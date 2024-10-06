@@ -1659,7 +1659,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, splice_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}):
+    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS"):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1685,7 +1685,12 @@ cdef class AlignmentFile(HTSFile):
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag(sam_options['CB']) or ((sam_options['UMI'] is not None) and (not r.has_tag(sam_options['UMI']))) or r.is_secondary or (forward_strand == r.is_reverse):
+            if (cigar is None
+                    or not r.has_tag(sam_options['CB'])
+                    or ((sam_options['UMI'] is not None)
+                        and (not r.has_tag(sam_options['UMI'])))
+                    or r.is_secondary
+                    or (forward_strand == r.is_reverse)):
                 continue
 
             if sam_options['UMI'] is None:
@@ -1697,16 +1702,19 @@ cdef class AlignmentFile(HTSFile):
             #handle different strand orientation. only for positively stranded case
             if not forward_strand:
                 cigar = list(map(lambda st: (st[0], -st[1]), reversed(cigar)))
+                #TODO: infer_query_length doesn't consider hard clipped bases.
+                # make sure that it's consistent
                 base_position += r.infer_query_length()
 
             cref_skip_minus_strand_previous = False
 
+            #TODO: check that previous base_position == donot_site
             for op, nt in cigar:
                 if op in match_or_deletion:
                     base_position += nt
                     not_start = True
                     # this will happen if we go in reverse
-                    if base_position == splice_site:
+                    if base_position == acceptor_site:
                         # this check is for when a 5' splice site is present
                         # at the exact position where a 3' splice site shoule be
                         if not forward_strand:
@@ -1721,7 +1729,7 @@ cdef class AlignmentFile(HTSFile):
                     #junc_start = base_position
                     base_position += nt
                     # this will happen if we go forward
-                    if base_position == splice_site:
+                    if base_position == acceptor_site:
                         if not forward_strand:
                             cref_skip_minus_strand_previous = False
                             continue

@@ -168,7 +168,8 @@ class AlignmentFile(HTSFile):
         acceptor_site: int,
         forward_strand: bool,
         sam_options: dict,
-        etype: str
+        etype: str,
+        no_match_splice_donor: bool
     ) -> Dict[str, set]: ...
     def close(self) -> None: ...
     def write(self, read: AlignedSegment) -> int: ...

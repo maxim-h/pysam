@@ -1659,7 +1659,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS"):
+    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_donor = False):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1700,52 +1700,21 @@ cdef class AlignmentFile(HTSFile):
             else:
                 umi = r.get_tag(sam_options['UMI'])
 
-            #handle different strand orientation. only for positively stranded case
-            #TODO: user defined strandedness
-            #if not forward_strand:
-            #    cigar = list(map(lambda st: (st[0], -st[1]), reversed(cigar)))
-            #    #TODO: infer_query_length doesn't consider hard clipped bases.
-            #    # make sure that it's consistent
-            #    base_position += r.infer_query_length()
-
-
-            #TODO: check that previous base_position == donot_site
             for op, nt in cigar:
                 if op in match_or_deletion:
                     base_position += nt
-               #     not_start = True
-
-               #     # this will happen if we go in reverse
-               #     if base_position == acceptor_site:
-               #         # this check is for when a 5' splice site is present
-               #         # at the exact position where a 3' splice site shoule be
-               #         if not forward_strand:
-               #             # Will add the UMI, but only if on the next iteration
-               #             # we see BAM_CREF_SKIP
-               #             cref_skip_minus_strand_previous = True
                 elif op == BAM_CREF_SKIP:
-                    #if cref_skip_minus_strand_previous:
-                    #    res[r.get_tag(sam_options['CB'])].add(umi)
-                    #    cref_skip_minus_strand_previous = False
-                    #    continue
-                    # pray to god these are value assignments
                     junc_start = base_position
                     base_position += nt
                     junc_end = base_position
-                    # this will happen if we go forward
+
                     if forward_strand:
-                        if (junc_end == acceptor_site) and (junc_start == donor_site):
-                            #if not forward_strand:
-                            #    cref_skip_minus_strand_previous = False
-                            #    continue
+                        if (junc_end == acceptor_site) and (no_match_splice_donor or (junc_start == donor_site)):
                             res[r.get_tag(sam_options['CB'])].add(umi)
                     else:
-                        if (junc_start == acceptor_site) and (junc_end == donor_site):
-                            #if not forward_strand:
-                            #    cref_skip_minus_strand_previous = False
-                            #    continue
+                        if (junc_start == acceptor_site) and (no_match_splice_donor  or (junc_end == donor_site)):
                             res[r.get_tag(sam_options['CB'])].add(umi)
-                    #cref_skip_minus_strand_previous = False
+
         return res
 
 

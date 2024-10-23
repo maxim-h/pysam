@@ -1659,7 +1659,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_donor = False):
+    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_partner = False):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1674,14 +1674,20 @@ cdef class AlignmentFile(HTSFile):
             AlignedSegment r
             int BAM_CREF_SKIP = 3 #BAM_CREF_SKIP
             bint not_start
-            bint cref_skip_minus_strand_previous
-            bint donor_site_matched_previous
+            bint no_match_donor_site
+            bint no_match_acceptor_site
 
         res = collections.defaultdict(set)
 
         un = 0
 
         match_or_deletion = {0, 2, 7, 8} # only M/=/X (0/7/8) and D (2) are related to genome position
+
+        no_match_donor_site = (etype == "A3SS") and no_match_splice_partner
+        no_match_acceptor_site = (etype == "A5SS") and no_match_splice_partner
+        if no_match_donor_site and no_match_acceptor_site:
+            raise AssertionError("Can't ignore both donor and acceptor spice sites")
+
         for r in read_iterator:
             not_start = False
             base_position = r.pos
@@ -1709,10 +1715,16 @@ cdef class AlignmentFile(HTSFile):
                     junc_end = base_position
 
                     if forward_strand:
-                        if (junc_end == acceptor_site) and (no_match_splice_donor or (junc_start == donor_site)):
+                        if ((no_match_acceptor_site
+                                or junc_end == acceptor_site)
+                            and (no_match_donor_site
+                                or junc_start == donor_site)):
                             res[r.get_tag(sam_options['CB'])].add(umi)
                     else:
-                        if (junc_start == acceptor_site) and (no_match_splice_donor  or (junc_end == donor_site)):
+                        if ((no_match_acceptor_site
+                                or junc_start == acceptor_site)
+                            and (no_match_donor_site
+                                 or junc_end == donor_site)):
                             res[r.get_tag(sam_options['CB'])].add(umi)
 
         return res

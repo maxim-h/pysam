@@ -1,6 +1,6 @@
 /*  vcfmerge.c -- Merge multiple VCF/BCF files to create one multi-sample file.
 
-    Copyright (C) 2012-2022 Genome Research Ltd.
+    Copyright (C) 2012-2024 Genome Research Ltd.
 
     Author: Petr Danecek <pd3@sanger.ac.uk>
 
@@ -34,6 +34,8 @@ THE SOFTWARE.  */
 #include <htslib/synced_bcf_reader.h>
 #include <htslib/vcfutils.h>
 #include <htslib/faidx.h>
+#include <htslib/kbitset.h>
+#include <htslib/hts_endian.h>
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
@@ -62,6 +64,19 @@ typedef khash_t(strdict) strdict_t;
 #define SWAP(type_t,a,b) { type_t tmp = (a); (a) = (b); (b) = tmp; }
 
 #define PL2PROB_MAX 1024
+
+// Rules for merging FORMAT Number=A,G,R vectors with missing values
+#define MERGE_MISSING_DOT   0   // leave as is, i.e. use a missing value "."
+#define MERGE_MISSING_CONST 1   // use a constant value
+#define MERGE_MISSING_MAX   2   // use the existing maximum value
+
+typedef struct _missing_rule_t
+{
+    char *hdr_tag;
+    int type;
+    float value;
+}
+missing_rule_t;
 
 // For merging INFO Number=A,G,R tags
 typedef struct
@@ -103,29 +118,37 @@ typedef struct
     int *map;   // mapping from input alleles to the array of output alleles (set by merge_alleles)
     int mmap;   // size of map array (only buffer[i].n_allele is actually used)
     int als_differ;
+    int var_types;  // variant types in this record, shifted by <<1 to account for VCF_REF
 }
 maux1_t;
+
+// Buffered lines for a single reader
 typedef struct
 {
     int rid;        // current rid
     int beg,end;    // valid ranges in reader's buffer [beg,end). Maintained by maux_reset and gvcf_flush.
+    int unkn_allele;// the index of the unknown allele (<*>, <NON_REF>)
     int cur;        // current line or -1 if none
     int mrec;       // allocated size of buf
     maux1_t *rec;   // buffer to keep reader's lines
     bcf1_t **lines; // source buffer: either gvcf or readers' buffer
+    int var_types;  // reader's variant types in the active [beg,end] window
 }
 buffer_t;
 typedef struct
 {
-    int n, pos, var_types;  // number of readers, current position, currently available variant types
+    int n, pos, var_types;  // number of readers; current position; variant types at this position across all available records
+    int *als_types,         // allele type of each output allele
+        mals_types;
     char *chr;              // current chromosome
     char **als, **out_als;  // merged alleles (temp, may contain empty records) and merged alleles ready for output
     int nals, mals, nout_als, mout_als; // size of the output array
     int *cnt, ncnt; // number of records that refer to the alleles
     int *smpl_ploidy, *smpl_nGsize; // ploidy and derived number of values in Number=G tags, updated for each line (todo: cache for missing cases)
+    const char **fmt_key;// temporary short-lived array to store output tag names
     bcf_fmt_t **fmt_map; // i-th output FORMAT field corresponds in j-th reader to i*nreader+j, first row is reserved for GT
     int nfmt_map;        // number of rows in the fmt_map array
-    int *agr_map, nagr_map, magr_map;   // mapping between Number=AGR element indexes
+    int *agr_map, nagr_map, magr_map;   // mapping between Number=AGR element indexes, from src idxs to dst file idxs
     void *tmp_arr;
     size_t ntmp_arr;
     buffer_t *buf;
@@ -151,11 +174,14 @@ typedef struct
     maux_t *maux;
     regidx_t *regs;    // apply regions only after the blocks are expanded
     regitr_t *regs_itr;
-    int header_only, collapse, output_type, force_samples, merge_by_id, do_gvcf, filter_logic, missing_to_ref, no_index;
+    int header_only, collapse, output_type, force_samples, force_single, merge_by_id, do_gvcf, filter_logic, missing_to_ref, no_index;
     char *header_fname, *output_fname, *regions_list, *info_rules, *file_list;
     faidx_t *gvcf_fai;
     info_rule_t *rules;
     int nrules;
+    char *missing_rules_str;
+    missing_rule_t *missing_rules;    // lookup for -M, --missing-rules
+    int nmissing_rules;
     strdict_t *tmph;
     kstring_t tmps;
     bcf_srs_t *files;
@@ -166,6 +192,9 @@ typedef struct
     int argc, n_threads, record_cmd_line, clevel;
     int local_alleles;    // the value of -L option
     int keep_AC_AN;
+    char *index_fn;
+    int write_index;
+    int trim_star_allele;   // 0=don't trim; 1=trim at variant sites; 2=trim at all sites
 }
 args_t;
 
@@ -298,6 +327,89 @@ static void info_rules_merge_join(bcf_hdr_t *hdr, bcf1_t *line, info_rule_t *rul
     }
 }
 
+static int missing_rules_comp_key2(const void *a, const void *b)
+{
+    missing_rule_t *rule1 = (missing_rule_t*) a;
+    missing_rule_t *rule2 = (missing_rule_t*) b;
+    return strcmp(rule1->hdr_tag, rule2->hdr_tag);
+}
+static int missing_rules_comp_key(const void *a, const void *b)
+{
+    char *key = (char*) a;
+    missing_rule_t *rule = (missing_rule_t*) b;
+    return strcmp(key, rule->hdr_tag);
+}
+static void missing_rules_init(args_t *args)
+{
+    kstring_t str = {0,0,0};
+    if ( args->missing_rules_str )
+    {
+        if ( !strcmp("-",args->missing_rules_str) ) kputs("PL:.,AD:.",&str);
+        else kputs(args->missing_rules_str,&str);
+    }
+    else if ( args->do_gvcf ) kputs("PL:max,AD:0",&str);
+    else return;
+
+    args->nmissing_rules = 1;
+    char *ss = str.s, *tmp = ss;
+    int n = 0;
+    while ( *ss )
+    {
+        if ( *ss==':' ) { *ss = 0; n++; if ( n%2==0 ) error("Could not parse --missing-rules: \"%s\"\n", args->missing_rules_str); }
+        else if ( *ss==',' ) { *ss = 0; args->nmissing_rules++; n++; if ( n%2==1 ) error("Could not parse --missing-rules: \"%s\"\n", args->missing_rules_str); }
+        ss++;
+    }
+    if ( n%2==0 ) error("Could not parse --missing-rules: \"%s\"\n", args->missing_rules_str);
+    args->missing_rules = (missing_rule_t*) calloc(args->nmissing_rules,sizeof(missing_rule_t));
+
+    n = args->nmissing_rules;
+    args->nmissing_rules = 0;
+    ss = tmp;
+    while ( args->nmissing_rules < n  )
+    {
+        missing_rule_t *rule = &args->missing_rules[args->nmissing_rules];
+        rule->hdr_tag = strdup(ss);
+        int id = bcf_hdr_id2int(args->out_hdr, BCF_DT_ID, rule->hdr_tag);
+        if ( !bcf_hdr_idinfo_exists(args->out_hdr,BCF_HL_FMT,id) )
+        {
+            if ( args->missing_rules_str ) error("The FORMAT tag is not defined in the header: \"%s\"\n", rule->hdr_tag);
+            free(rule->hdr_tag);
+            n--;
+            ss = strchr(ss, '\0'); ss++;
+            if ( !*ss ) error("Could not parse --missing-rules, missing logic of \"%s\"\n", rule->hdr_tag);
+            ss = strchr(ss, '\0'); ss++;
+            continue;
+        }
+
+        ss = strchr(ss, '\0'); ss++;
+        if ( !*ss ) error("Could not parse --missing-rules, missing logic of \"%s\"\n", rule->hdr_tag);
+
+        if ( !strcasecmp(ss,".") ) rule->type = MERGE_MISSING_DOT;
+        else if ( !strcasecmp(ss,"max") ) rule->type = MERGE_MISSING_MAX;
+        else
+        {
+            char *tmp = ss;
+            rule->value = strtod(ss, &tmp);
+            if ( *tmp ) error("Could not parse --missing-rules: \"%s\"\n", args->missing_rules_str);
+            rule->type = MERGE_MISSING_CONST;
+        }
+        ss = strchr(ss, '\0'); ss++;
+        args->nmissing_rules++;
+    }
+    qsort(args->missing_rules, args->nmissing_rules, sizeof(*args->missing_rules), missing_rules_comp_key2);
+    free(str.s);
+}
+static void missing_rules_destroy(args_t *args)
+{
+    int i;
+    for (i=0; i<args->nmissing_rules; i++)
+    {
+        missing_rule_t *rule = &args->missing_rules[i];
+        free(rule->hdr_tag);
+    }
+    free(args->missing_rules);
+}
+
 static int info_rules_comp_key2(const void *a, const void *b)
 {
     info_rule_t *rule1 = (info_rule_t*) a;
@@ -327,6 +439,11 @@ static void info_rules_init(args_t *args)
         {
             if ( str.l ) kputc(',',&str);
             kputs("QS:sum",&str);
+        }
+        if ( args->do_gvcf && bcf_hdr_idinfo_exists(args->out_hdr,BCF_HL_INFO,bcf_hdr_id2int(args->out_hdr, BCF_DT_ID, "MIN_DP")) )
+        {
+            if ( str.l ) kputc(',',&str);
+            kputs("MIN_DP:min",&str);
         }
         if ( args->do_gvcf && bcf_hdr_idinfo_exists(args->out_hdr,BCF_HL_INFO,bcf_hdr_id2int(args->out_hdr, BCF_DT_ID, "MinDP")) )
         {
@@ -770,6 +887,7 @@ void maux_destroy(maux_t *ma)
     int i,j;
     for (i=0; i<ma->nout_smpl; i++) free(ma->str[i].s);
     free(ma->str);
+    free(ma->als_types);
     for (i=0; i<ma->mals; i++)
     {
         free(ma->als[i]);
@@ -793,6 +911,7 @@ void maux_destroy(maux_t *ma)
     free(ma->AGR_info);
     if (ma->ntmp_arr) free(ma->tmp_arr);
     if (ma->nfmt_map) free(ma->fmt_map);
+    free(ma->fmt_key);
     // ma->inf freed in bcf_destroy1
     for (i=0; i<ma->mals; i++) free(ma->als[i]);
     if (ma->mout_als) free(ma->out_als);
@@ -820,7 +939,6 @@ void maux_reset(maux_t *ma, int *rid_tab)
 {
     int i,j;
     for (i=0; i<ma->n; i++) maux_expand1(&ma->buf[i],ma->files->readers[i].nbuffer+1);
-    for (i=0; i<ma->ncnt; i++) ma->cnt[i] = 0;
     for (i=0; i<ma->mals; i++)
     {
         free(ma->als[i]);
@@ -856,6 +974,7 @@ void maux_reset(maux_t *ma, int *rid_tab)
         for (j=ma->buf[i].beg; j<=ma->files->readers[i].nbuffer; j++)
         {
             ma->buf[i].rec[j].skip = 0;
+            ma->buf[i].rec[j].var_types = 0;
             bcf1_t *line = ma->files->readers[i].buffer[j];
             if ( line->rid!=ma->buf[i].rid || line->pos!=ma->pos ) break;
         }
@@ -959,12 +1078,14 @@ void merge_chrom2qual(args_t *args, bcf1_t *out)
         int ir, j;
         for (ir=0; ir<files->nreaders; ir++)
         {
+            ma->buf[ir].unkn_allele = 0;
             bcf1_t *line = maux_get_line(args,ir);
             if ( !line ) continue;
             for (j=1; j<line->n_allele; j++)
             {
                 int irec = ma->buf[ir].cur;
                 if ( ma->buf[ir].rec[irec].map[j]==i ) ma->buf[ir].rec[irec].map[j] = ma->nout_als;
+                if ( bcf_has_variant_type(line,j,VCF_REF) && line->d.allele[j][0]=='<' ) ma->buf[ir].unkn_allele = j;
             }
         }
     }
@@ -1159,32 +1280,32 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
         if ( len==BCF_VL_A || len==BCF_VL_R )
         {
             int ifrom = len==BCF_VL_A ? 1 : 0;
-            #define BRANCH(type_t, is_missing, is_vector_end, out_type_t) { \
-                type_t *src = (type_t *) info->vptr; \
+            #define BRANCH(type_t, convert, is_missing, is_vector_end, out_type_t) { \
+                uint8_t *src = info->vptr; \
                 out_type_t *tgt = (out_type_t *) agr->buf; \
                 int iori, inew; \
-                for (iori=ifrom; iori<line->n_allele; iori++) \
+                for (iori=ifrom; iori<line->n_allele; iori++, src += sizeof(type_t)) \
                 { \
+                    type_t val = convert(src); \
                     if ( is_vector_end ) break; \
                     if ( is_missing ) continue; \
                     inew = als->map[iori] - ifrom; \
-                    tgt[inew] = *src; \
-                    src++; \
+                    tgt[inew] = val; \
                 } \
             }
             switch (info->type) {
-                case BCF_BT_INT8:  BRANCH(int8_t,  *src==bcf_int8_missing,  *src==bcf_int8_vector_end,  int); break;
-                case BCF_BT_INT16: BRANCH(int16_t, *src==bcf_int16_missing, *src==bcf_int16_vector_end, int); break;
-                case BCF_BT_INT32: BRANCH(int32_t, *src==bcf_int32_missing, *src==bcf_int32_vector_end, int); break;
-                case BCF_BT_FLOAT: BRANCH(float,   bcf_float_is_missing(*src), bcf_float_is_vector_end(*src), float); break;
+                case BCF_BT_INT8:  BRANCH(int8_t,  le_to_i8,  val==bcf_int8_missing,  val==bcf_int8_vector_end,  int); break;
+                case BCF_BT_INT16: BRANCH(int16_t, le_to_i16, val==bcf_int16_missing, val==bcf_int16_vector_end, int); break;
+                case BCF_BT_INT32: BRANCH(int32_t, le_to_i32, val==bcf_int32_missing, val==bcf_int32_vector_end, int); break;
+                case BCF_BT_FLOAT: BRANCH(float,   le_to_float, bcf_float_is_missing(val), bcf_float_is_vector_end(val), float); break;
                 default: fprintf(stderr,"TODO: %s:%d .. info->type=%d\n", __FILE__,__LINE__, info->type); exit(1);
             }
             #undef BRANCH
         }
         else
         {
-            #define BRANCH(type_t, is_missing, is_vector_end, out_type_t) { \
-                type_t *src = (type_t *) info->vptr; \
+            #define BRANCH(type_t, convert, is_missing, is_vector_end, out_type_t) { \
+                uint8_t *src = info->vptr; \
                 out_type_t *tgt = (out_type_t *) agr->buf; \
                 int iori,jori, inew,jnew; \
                 for (iori=0; iori<line->n_allele; iori++) \
@@ -1194,19 +1315,20 @@ static void merge_AGR_info_tag(bcf_hdr_t *hdr, bcf1_t *line, bcf_info_t *info, i
                     { \
                         jnew = als->map[jori]; \
                         int kori = iori*(iori+1)/2 + jori; \
+                        type_t val = convert(&src[kori * sizeof(type_t)]); \
                         if ( is_vector_end ) break; \
                         if ( is_missing ) continue; \
                         int knew = inew>jnew ? inew*(inew+1)/2 + jnew : jnew*(jnew+1)/2 + inew; \
-                        tgt[knew] = src[kori]; \
+                        tgt[knew] = val; \
                     } \
                     if ( jori<=iori ) break; \
                 } \
             }
             switch (info->type) {
-                case BCF_BT_INT8:  BRANCH(int8_t,  src[kori]==bcf_int8_missing,  src[kori]==bcf_int8_vector_end,  int); break;
-                case BCF_BT_INT16: BRANCH(int16_t, src[kori]==bcf_int16_missing, src[kori]==bcf_int16_vector_end, int); break;
-                case BCF_BT_INT32: BRANCH(int32_t, src[kori]==bcf_int32_missing, src[kori]==bcf_int32_vector_end, int); break;
-                case BCF_BT_FLOAT: BRANCH(float,   bcf_float_is_missing(src[kori]), bcf_float_is_vector_end(src[kori]), float); break;
+                case BCF_BT_INT8:  BRANCH(int8_t,  le_to_i8,  val==bcf_int8_missing,  val==bcf_int8_vector_end,  int); break;
+                case BCF_BT_INT16: BRANCH(int16_t, le_to_i16, val==bcf_int16_missing, val==bcf_int16_vector_end, int); break;
+                case BCF_BT_INT32: BRANCH(int32_t, le_to_i32, val==bcf_int32_missing, val==bcf_int32_vector_end, int); break;
+                case BCF_BT_FLOAT: BRANCH(float,   le_to_float, bcf_float_is_missing(val), bcf_float_is_vector_end(val), float); break;
                 default: fprintf(stderr,"TODO: %s:%d .. info->type=%d\n", __FILE__,__LINE__, info->type); exit(1);
             }
             #undef BRANCH
@@ -1375,12 +1497,12 @@ static inline int max_used_gt_ploidy(bcf_fmt_t *fmt, int nsmpl)
 {
     int i,j, max_ploidy = 0;
 
-    #define BRANCH(type_t, vector_end) { \
-        type_t *ptr  = (type_t*) fmt->p; \
+    #define BRANCH(type_t, convert, vector_end) { \
+        uint8_t *ptr  = fmt->p; \
         for (i=0; i<nsmpl; i++) \
         { \
             for (j=0; j<fmt->n; j++) \
-                if ( ptr[j]==vector_end ) break; \
+                if ( convert(&ptr[j * sizeof(type_t)])==vector_end ) break; \
             if ( j==fmt->n ) \
             { \
                 /* all fields were used */ \
@@ -1388,14 +1510,14 @@ static inline int max_used_gt_ploidy(bcf_fmt_t *fmt, int nsmpl)
                 break; \
             } \
             if ( max_ploidy < j ) max_ploidy = j; \
-            ptr += fmt->n; \
+            ptr += fmt->n * sizeof(type_t); \
         } \
     }
     switch (fmt->type)
     {
-        case BCF_BT_INT8:  BRANCH(int8_t,   bcf_int8_vector_end); break;
-        case BCF_BT_INT16: BRANCH(int16_t, bcf_int16_vector_end); break;
-        case BCF_BT_INT32: BRANCH(int32_t, bcf_int32_vector_end); break;
+        case BCF_BT_INT8:  BRANCH(int8_t,  le_to_i8,  bcf_int8_vector_end); break;
+        case BCF_BT_INT16: BRANCH(int16_t, le_to_i16, bcf_int16_vector_end); break;
+        case BCF_BT_INT32: BRANCH(int32_t, le_to_i32, bcf_int32_vector_end); break;
         default: error("Unexpected case: %d\n", fmt->type);
     }
     #undef BRANCH
@@ -1485,19 +1607,22 @@ void init_local_alleles(args_t *args, bcf1_t *out, int ifmt_PL)
         int *map = ma->buf[i].rec[ma->buf[i].cur].map;
         double *allele_prob = ma->tmpd;
         int *idx = ma->tmpi;
-        #define BRANCH(src_type_t, src_is_missing, src_is_vector_end, pl2prob_idx) { \
-            src_type_t *src = (src_type_t*) fmt_ori->p; \
+        #define BRANCH(src_type_t, convert, src_is_missing, src_is_vector_end, pl2prob_idx) { \
+            uint8_t *src = fmt_ori->p; \
             for (j=0; j<nsmpl; j++) \
             { \
                 for (k=0; k<line->n_allele; k++) allele_prob[k] = 0; \
                 for (k=0; k<line->n_allele; k++) \
                     for (l=0; l<=k; l++) \
                     { \
-                        if ( src_is_missing || src_is_vector_end ) { src++; continue; } \
-                        double prob = ma->pl2prob[pl2prob_idx]; \
-                        allele_prob[k] += prob; \
-                        allele_prob[l] += prob; \
-                        src++; \
+                        src_type_t val = convert(src); \
+                        if ( !(src_is_missing) && !(src_is_vector_end) ) \
+                        { \
+                            double prob = ma->pl2prob[pl2prob_idx]; \
+                            allele_prob[k] += prob; \
+                            allele_prob[l] += prob; \
+                        } \
+                        src += sizeof(src_type_t); \
                     } \
                 /* insertion sort by allele probability, descending order, with the twist that REF (idx=0) always comes first */ \
                 allele_prob++; idx[0] = -1; idx++; /* keep REF first */ \
@@ -1524,9 +1649,9 @@ void init_local_alleles(args_t *args, bcf1_t *out, int ifmt_PL)
         }
         switch (fmt_ori->type)
         {
-            case BCF_BT_INT8:  BRANCH( int8_t, *src==bcf_int8_missing,  *src==bcf_int8_vector_end,  *src); break;
-            case BCF_BT_INT16: BRANCH(int16_t, *src==bcf_int16_missing, *src==bcf_int16_vector_end, *src>=0 && *src<PL2PROB_MAX ? *src : PL2PROB_MAX-1); break;
-            case BCF_BT_INT32: BRANCH(int32_t, *src==bcf_int32_missing, *src==bcf_int32_vector_end, *src>=0 && *src<PL2PROB_MAX ? *src : PL2PROB_MAX-1); break;
+            case BCF_BT_INT8:  BRANCH( int8_t, le_to_i8,  val==bcf_int8_missing,  val==bcf_int8_vector_end,  val); break;
+            case BCF_BT_INT16: BRANCH(int16_t, le_to_i16, val==bcf_int16_missing, val==bcf_int16_vector_end, val>=0 && val<PL2PROB_MAX ? val : PL2PROB_MAX-1); break;
+            case BCF_BT_INT32: BRANCH(int32_t, le_to_i32, val==bcf_int32_missing, val==bcf_int32_vector_end, val>=0 && val<PL2PROB_MAX ? val : PL2PROB_MAX-1); break;
             default: error("Unexpected case: %d, PL\n", fmt_ori->type);
         }
         #undef BRANCH
@@ -1622,8 +1747,8 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             continue;
         }
 
-        #define BRANCH(type_t, vector_end) { \
-            type_t *p_ori  = (type_t*) fmt_ori->p; \
+        #define BRANCH(type_t, convert, vector_end) { \
+            uint8_t *p_ori = fmt_ori->p; \
             if ( !ma->buf[i].rec[irec].als_differ ) \
             { \
                 /* the allele numbering is unchanged */ \
@@ -1631,14 +1756,15 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                 { \
                     for (k=0; k<fmt_ori->n; k++) \
                     { \
-                        if ( p_ori[k]==vector_end ) break; /* smaller ploidy */ \
+                        type_t val = convert(&p_ori[k * sizeof(type_t)]); \
+                        if ( val==vector_end ) break; /* smaller ploidy */ \
                         ma->smpl_ploidy[ismpl+j]++; \
-                        if ( bcf_gt_is_missing(p_ori[k]) ) tmp[k] = 0; /* missing allele */ \
-                        else tmp[k] = p_ori[k]; \
+                        if ( bcf_gt_is_missing(val) ) tmp[k] = 0; /* missing allele */ \
+                        else tmp[k] = val; \
                     } \
                     for (; k<nsize; k++) tmp[k] = bcf_int32_vector_end; \
                     tmp += nsize; \
-                    p_ori += fmt_ori->n; \
+                    p_ori += fmt_ori->n * sizeof(type_t); \
                 } \
                 ismpl += bcf_hdr_nsamples(hdr); \
                 continue; \
@@ -1648,27 +1774,28 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
             { \
                 for (k=0; k<fmt_ori->n; k++) \
                 { \
-                    if ( p_ori[k]==vector_end ) break; /* smaller ploidy */ \
+                    type_t val = convert(&p_ori[k * sizeof(type_t)]); \
+                    if ( val==vector_end ) break; /* smaller ploidy */ \
                     ma->smpl_ploidy[ismpl+j]++; \
-                    if ( bcf_gt_is_missing(p_ori[k]) ) tmp[k] = 0; /* missing allele */ \
+                    if ( bcf_gt_is_missing(val) ) tmp[k] = 0; /* missing allele */ \
                     else \
                     { \
-                        int al = (p_ori[k]>>1) - 1; \
+                        int al = (val>>1) - 1; \
                         al = al<=0 ? al + 1 : ma->buf[i].rec[irec].map[al] + 1; \
-                        tmp[k] = (al << 1) | ((p_ori[k])&1); \
+                        tmp[k] = (al << 1) | ((val)&1); \
                     } \
                 } \
                 for (; k<nsize; k++) tmp[k] = bcf_int32_vector_end; \
                 tmp += nsize; \
-                p_ori += fmt_ori->n; \
+                p_ori += fmt_ori->n * sizeof(type_t); \
             } \
             ismpl += bcf_hdr_nsamples(hdr); \
         }
         switch (fmt_ori->type)
         {
-            case BCF_BT_INT8: BRANCH(int8_t,   bcf_int8_vector_end); break;
-            case BCF_BT_INT16: BRANCH(int16_t, bcf_int16_vector_end); break;
-            case BCF_BT_INT32: BRANCH(int32_t, bcf_int32_vector_end); break;
+            case BCF_BT_INT8: BRANCH(int8_t,   le_to_i8,  bcf_int8_vector_end); break;
+            case BCF_BT_INT16: BRANCH(int16_t, le_to_i16, bcf_int16_vector_end); break;
+            case BCF_BT_INT32: BRANCH(int32_t, le_to_i32, bcf_int32_vector_end); break;
             default: error("Unexpected case: %d\n", fmt_ori->type);
         }
         #undef BRANCH
@@ -1846,10 +1973,10 @@ void merge_localized_numberG_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf
         if ( 2*fmt_ori->n!=line->n_allele*(line->n_allele+1) ) error("Todo: localization of missing or haploid Number=G tags\n");
 
         // localize
-        #define BRANCH(tgt_type_t, src_type_t, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
+        #define BRANCH(tgt_type_t, src_type_t, convert, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
             for (j=0; j<nsmpl; j++) \
             { \
-                src_type_t *src = (src_type_t*) fmt_ori->p + j*fmt_ori->n; \
+                uint8_t *src = fmt_ori->p + sizeof(src_type_t)*j*fmt_ori->n; \
                 tgt_type_t *tgt = (tgt_type_t *) ma->tmp_arr + ismpl*nsize; \
                 int *laa = ma->laa + (1+args->local_alleles)*ismpl; \
                 int ii,ij,tgt_idx = 0; \
@@ -1859,9 +1986,10 @@ void merge_localized_numberG_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf
                     for (ij=0; ij<=ii; ij++) \
                     { \
                         int src_idx = bcf_alleles2gt(laa[ii],laa[ij]); \
+                        src_type_t val = convert(&src[src_idx * sizeof(src_type_t)]); \
                         if ( src_is_missing ) tgt_set_missing; \
                         else if ( src_is_vector_end ) break; \
-                        else tgt[tgt_idx] = src[src_idx]; \
+                        else tgt[tgt_idx] = val; \
                         tgt_idx++; \
                     } \
                 } \
@@ -1872,10 +2000,10 @@ void merge_localized_numberG_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf
         }
         switch (fmt_ori->type)
         {
-            case BCF_BT_INT8:  BRANCH(int32_t,  int8_t, src[src_idx]==bcf_int8_missing,  src[src_idx]==bcf_int8_vector_end,  tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_INT16: BRANCH(int32_t, int16_t, src[src_idx]==bcf_int16_missing, src[src_idx]==bcf_int16_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_INT32: BRANCH(int32_t, int32_t, src[src_idx]==bcf_int32_missing, src[src_idx]==bcf_int32_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_FLOAT: BRANCH(float, float, bcf_float_is_missing(src[src_idx]), bcf_float_is_vector_end(src[src_idx]), bcf_float_set_missing(tgt[tgt_idx]), bcf_float_set_vector_end(tgt[tgt_idx])); break;
+            case BCF_BT_INT8:  BRANCH(int32_t, int8_t,  le_to_i8,  val==bcf_int8_missing,  val==bcf_int8_vector_end,  tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_INT16: BRANCH(int32_t, int16_t, le_to_i16, val==bcf_int16_missing, val==bcf_int16_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_INT32: BRANCH(int32_t, int32_t, le_to_i16, val==bcf_int32_missing, val==bcf_int32_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_FLOAT: BRANCH(float, float, le_to_float, bcf_float_is_missing(val), bcf_float_is_vector_end(val), bcf_float_set_missing(tgt[tgt_idx]), bcf_float_set_vector_end(tgt[tgt_idx])); break;
             default: error("Unexpected case: %d, %s\n", fmt_ori->type, key);
         }
         #undef BRANCH
@@ -1945,10 +2073,10 @@ void merge_localized_numberAR_format_field(args_t *args, bcf_fmt_t **fmt_map, bc
         }
 
         // localize
-        #define BRANCH(tgt_type_t, src_type_t, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
+        #define BRANCH(tgt_type_t, src_type_t, convert, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
             for (j=0; j<nsmpl; j++) \
             { \
-                src_type_t *src = (src_type_t*) fmt_ori->p + j*fmt_ori->n; \
+                uint8_t *src = fmt_ori->p + sizeof(src_type_t)*j*fmt_ori->n; \
                 tgt_type_t *tgt = (tgt_type_t *) ma->tmp_arr + ismpl*nsize; \
                 int *laa = ma->laa + (1+args->local_alleles)*ismpl; \
                 int ii,tgt_idx = 0; \
@@ -1956,9 +2084,10 @@ void merge_localized_numberAR_format_field(args_t *args, bcf_fmt_t **fmt_map, bc
                 { \
                     if ( laa[ii]==bcf_int32_missing || laa[ii]==bcf_int32_vector_end ) break; \
                     int src_idx = laa[ii] - ibeg; \
+                    src_type_t val = convert(&src[src_idx * sizeof(src_type_t)]); \
                     if ( src_is_missing ) tgt_set_missing; \
                     else if ( src_is_vector_end ) break; \
-                    else tgt[tgt_idx] = src[src_idx]; \
+                    else tgt[tgt_idx] = val; \
                     tgt_idx++; \
                 } \
                 if ( !tgt_idx ) { tgt_set_missing; tgt_idx++; } \
@@ -1968,10 +2097,10 @@ void merge_localized_numberAR_format_field(args_t *args, bcf_fmt_t **fmt_map, bc
         }
         switch (fmt_ori->type)
         {
-            case BCF_BT_INT8:  BRANCH(int32_t,  int8_t, src[src_idx]==bcf_int8_missing,  src[src_idx]==bcf_int8_vector_end,  tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_INT16: BRANCH(int32_t, int16_t, src[src_idx]==bcf_int16_missing, src[src_idx]==bcf_int16_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_INT32: BRANCH(int32_t, int32_t, src[src_idx]==bcf_int32_missing, src[src_idx]==bcf_int32_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
-            case BCF_BT_FLOAT: BRANCH(float, float, bcf_float_is_missing(src[src_idx]), bcf_float_is_vector_end(src[src_idx]), bcf_float_set_missing(tgt[tgt_idx]), bcf_float_set_vector_end(tgt[tgt_idx])); break;
+            case BCF_BT_INT8:  BRANCH(int32_t, int8_t,  le_to_i8,  val==bcf_int8_missing,  val==bcf_int8_vector_end,  tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_INT16: BRANCH(int32_t, int16_t, le_to_i16, val==bcf_int16_missing, val==bcf_int16_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_INT32: BRANCH(int32_t, int32_t, le_to_i32, val==bcf_int32_missing, val==bcf_int32_vector_end, tgt[tgt_idx]=bcf_int32_missing, tgt[tgt_idx]=bcf_int32_vector_end); break;
+            case BCF_BT_FLOAT: BRANCH(float, float, le_to_float, bcf_float_is_missing(val), bcf_float_is_vector_end(val), bcf_float_set_missing(tgt[tgt_idx]), bcf_float_set_vector_end(tgt[tgt_idx])); break;
             default: error("Unexpected case: %d, %s\n", fmt_ori->type, key);
         }
         #undef BRANCH
@@ -1985,7 +2114,7 @@ void merge_localized_numberAR_format_field(args_t *args, bcf_fmt_t **fmt_map, bc
         bcf_update_format_int32(args->out_hdr, out, args->tmps.s, (int32_t*)ma->tmp_arr, nsamples*nsize);
     ma->laa_dirty = 1;
 }
-void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
+void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, missing_rule_t *mrule, bcf1_t *out)
 {
     bcf_srs_t *files = args->files;
     bcf_hdr_t *out_hdr = args->out_hdr;
@@ -2088,7 +2217,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         }
 
         // set the values
-        #define BRANCH(tgt_type_t, src_type_t, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
+        #define BRANCH(tgt_type_t, src_type_t, convert, src_is_missing, src_is_vector_end, tgt_set_missing, tgt_set_vector_end) { \
             int j, l, k; \
             tgt_type_t *tgt = (tgt_type_t *) ma->tmp_arr + ismpl*nsize; \
             if ( !fmt_ori ) \
@@ -2101,7 +2230,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                 ismpl += bcf_hdr_nsamples(hdr); \
                 continue; \
             } \
-            src_type_t *src = (src_type_t*) fmt_ori->p; \
+            uint8_t *src = fmt_ori->p; \
             if ( (length!=BCF_VL_G && length!=BCF_VL_A && length!=BCF_VL_R) || (line->n_allele==out->n_allele && !ma->buf[i].rec[irec].als_differ) ) \
             { \
                 /* alleles unchanged, copy over */ \
@@ -2111,11 +2240,11 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                     { \
                         if ( src_is_vector_end ) break; \
                         else if ( src_is_missing ) tgt_set_missing; \
-                        else *tgt = *src; \
-                        tgt++; src++; \
+                        else *tgt = convert(src); \
+                        tgt++; src += sizeof(src_type_t); \
                     } \
                     for (k=l; k<nsize; k++) { tgt_set_vector_end; tgt++; } \
-                    src += fmt_ori->n - l; \
+                    src += sizeof(src_type_t) * (fmt_ori->n - l); \
                 } \
                 ismpl += bcf_hdr_nsamples(hdr); \
                 continue; \
@@ -2127,29 +2256,59 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                 for (j=0; j<bcf_hdr_nsamples(hdr); j++) \
                 { \
                     tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize; \
-                    src = (src_type_t*) fmt_ori->p + j*fmt_ori->n; \
-                    if ( (src_is_missing && fmt_ori->n==1) || (++src && src_is_vector_end) ) \
+                    src = fmt_ori->p + sizeof(src_type_t) * j * fmt_ori->n; \
+                    int tag_missing = src_is_missing && fmt_ori->n==1;  \
+                    if ( src_is_missing && fmt_ori->n>1 ) { \
+                        src += sizeof(src_type_t); \
+                        tag_missing = src_is_vector_end ; \
+                    } \
+                    if ( tag_missing ) \
                     { \
                         /* tag with missing value "." */ \
                         tgt_set_missing; \
                         for (l=1; l<nsize; l++) { tgt++; tgt_set_vector_end; } \
                         continue; \
                     } \
-                    int ngsize = ma->smpl_ploidy[ismpl+j]==1 ? out->n_allele : out->n_allele*(out->n_allele + 1)/2; \
-                    for (l=0; l<ngsize; l++) { tgt_set_missing; tgt++; } \
-                    for (; l<nsize; l++) { tgt_set_vector_end; tgt++; } \
-                    if ( ma->smpl_ploidy[ismpl+j]==1 ) \
+                    int haploid = ma->smpl_ploidy[ismpl+j]==1 ? 1 : 0; \
+                    int ngsize = haploid ? out->n_allele : out->n_allele*(out->n_allele + 1)/2; \
+                    if ( ma->buf[i].unkn_allele )  /* Use value from the unknown allele when available */ \
+                    {  \
+                        src = fmt_ori->p + sizeof(src_type_t)*j*fmt_ori->n; \
+                        int iunkn = haploid ? ma->buf[i].unkn_allele : (ma->buf[i].unkn_allele+1)*(ma->buf[i].unkn_allele + 2)/2 - 1; \
+                        src_type_t val = convert(&src[iunkn * sizeof(src_type_t)]); \
+                        for (l=0; l<ngsize; l++) { *tgt = val; tgt++; } \
+                    } \
+                    else if ( mrule && mrule->type==MERGE_MISSING_CONST ) \
                     { \
-                        /* Haploid */ \
+                        for (l=0; l<ngsize; l++) { *tgt = mrule->value; tgt++; } \
+                    } \
+                    else if ( mrule && mrule->type==MERGE_MISSING_MAX ) \
+                    { \
+                        src = fmt_ori->p + sizeof(src_type_t)*j*fmt_ori->n; \
+                        src_type_t max = convert(src); \
+                        for (l=1; l<fmt_ori->n; l++) \
+                        { \
+                            src_type_t val = convert(&src[l * sizeof(src_type_t)]); \
+                            if ( max < val ) max = val; \
+                        } \
+                        for (l=0; l<ngsize; l++) { *tgt = max; tgt++; } \
+                    } \
+                    else \
+                    { \
+                        for (l=0; l<ngsize; l++) { tgt_set_missing; tgt++; } \
+                    } \
+                    for (; l<nsize; l++) { tgt_set_vector_end; tgt++; } \
+                    if ( haploid ) \
+                    { \
                         int iori, inew; \
                         for (iori=0; iori<line->n_allele; iori++) \
                         { \
                             inew = ma->buf[i].rec[irec].map[iori]; \
-                            src = (src_type_t*) fmt_ori->p + j*fmt_ori->n + iori; \
+                            src = fmt_ori->p + (j*fmt_ori->n + iori) * sizeof(src_type_t); \
                             tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize + inew; \
                             if ( src_is_vector_end ) break; \
                             if ( src_is_missing ) tgt_set_missing; \
-                            else *tgt = *src; \
+                            else *tgt = convert(src); \
                         } \
                     } \
                     else \
@@ -2164,7 +2323,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                                 jnew = ma->buf[i].rec[irec].map[jori]; \
                                 int kori = iori*(iori+1)/2 + jori; \
                                 int knew = inew>jnew ? inew*(inew+1)/2 + jnew : jnew*(jnew+1)/2 + inew; \
-                                src = (src_type_t*) fmt_ori->p + j*fmt_ori->n + kori; \
+                                src = fmt_ori->p + (j*fmt_ori->n + kori) * sizeof(src_type_t); \
                                 tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize + knew; \
                                 if ( src_is_vector_end ) \
                                 { \
@@ -2172,7 +2331,7 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                                     break; \
                                 } \
                                 if ( src_is_missing ) tgt_set_missing; \
-                                else *tgt = *src; \
+                                else *tgt = convert(src); \
                             } \
                         } \
                     } \
@@ -2185,16 +2344,45 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                 for (j=0; j<bcf_hdr_nsamples(hdr); j++) \
                 { \
                     tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize; \
-                    src = (src_type_t*) (fmt_ori->p + j*fmt_ori->size); \
-                    if ( (src_is_missing && fmt_ori->n==1) || (++src && src_is_vector_end) ) \
+                    src = fmt_ori->p + j*fmt_ori->size; \
+                    int tag_missing = src_is_missing && fmt_ori->n==1;  \
+                    if ( src_is_missing && fmt_ori->n>1 ) { \
+                        src += sizeof(src_type_t); \
+                        tag_missing = src_is_vector_end ; \
+                    } \
+                    if ( tag_missing ) \
                     { \
                         /* tag with missing value "." */ \
                         tgt_set_missing; \
                         for (l=1; l<nsize; l++) { tgt++; tgt_set_vector_end; } \
                         continue; \
                     } \
-                    src = (src_type_t*) (fmt_ori->p + j*fmt_ori->size); \
-                    for (l=0; l<nsize; l++) { tgt_set_missing; tgt++; } \
+                    src = fmt_ori->p + j*fmt_ori->size; \
+                    if ( ma->buf[i].unkn_allele )  /* Use value from the unknown allele when available */ \
+                    { \
+                        int iunkn = ma->buf[i].unkn_allele; \
+                        src_type_t val = convert(&src[iunkn * sizeof(src_type_t)]); \
+                        for (l=0; l<nsize; l++) { *tgt = val; tgt++; } \
+                    } \
+                    else if ( mrule && mrule->type==MERGE_MISSING_CONST ) \
+                    { \
+                        for (l=0; l<nsize; l++) { *tgt = mrule->value; tgt++; } \
+                    } \
+                    else if ( mrule && mrule->type==MERGE_MISSING_MAX ) \
+                    { \
+                        src = fmt_ori->p + sizeof(src_type_t)*j*fmt_ori->n; \
+                        src_type_t max = convert(src); \
+                        for (l=1; l<fmt_ori->n; l++) \
+                        { \
+                            src_type_t val = convert(&src[l * sizeof(src_type_t)]); \
+                            if ( max < val ) max = val; \
+                        } \
+                        for (l=0; l<nsize; l++) { *tgt = max; tgt++; } \
+                    } \
+                    else \
+                    { \
+                        for (l=0; l<nsize; l++) { tgt_set_missing; tgt++; } \
+                    } \
                     int iori,inew; \
                     for (iori=ifrom; iori<line->n_allele; iori++) \
                     { \
@@ -2202,8 +2390,8 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
                         tgt = (tgt_type_t *) ma->tmp_arr + (ismpl+j)*nsize + inew; \
                         if ( src_is_vector_end ) break; \
                         if ( src_is_missing ) tgt_set_missing; \
-                        else *tgt = *src; \
-                        src++; \
+                        else *tgt = convert(src); \
+                        src += sizeof(src_type_t); \
                     } \
                 } \
             } \
@@ -2211,10 +2399,10 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
         }
         switch (type)
         {
-            case BCF_BT_INT8:  BRANCH(int32_t,  int8_t, *src==bcf_int8_missing,  *src==bcf_int8_vector_end,  *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
-            case BCF_BT_INT16: BRANCH(int32_t, int16_t, *src==bcf_int16_missing, *src==bcf_int16_vector_end, *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
-            case BCF_BT_INT32: BRANCH(int32_t, int32_t, *src==bcf_int32_missing, *src==bcf_int32_vector_end, *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
-            case BCF_BT_FLOAT: BRANCH(float, float, bcf_float_is_missing(*src), bcf_float_is_vector_end(*src), bcf_float_set_missing(*tgt), bcf_float_set_vector_end(*tgt)); break;
+            case BCF_BT_INT8:  BRANCH(int32_t, int8_t,  le_to_i8,  le_to_i8(src)==bcf_int8_missing,  le_to_i8(src)==bcf_int8_vector_end,  *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
+            case BCF_BT_INT16: BRANCH(int32_t, int16_t, le_to_i16, le_to_i16(src)==bcf_int16_missing, le_to_i16(src)==bcf_int16_vector_end, *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
+            case BCF_BT_INT32: BRANCH(int32_t, int32_t, le_to_i32, le_to_i32(src)==bcf_int32_missing, le_to_i32(src)==bcf_int32_vector_end, *tgt=bcf_int32_missing, *tgt=bcf_int32_vector_end); break;
+            case BCF_BT_FLOAT: BRANCH(float, float, le_to_float, bcf_float_is_missing(le_to_float(src)), bcf_float_is_vector_end(le_to_float(src)), bcf_float_set_missing(*tgt), bcf_float_set_vector_end(*tgt)); break;
             default: error("Unexpected case: %d, %s\n", type, key);
         }
         #undef BRANCH
@@ -2234,6 +2422,7 @@ void merge_format(args_t *args, bcf1_t *out)
     {
         ma->nfmt_map = 2;
         ma->fmt_map  = (bcf_fmt_t**) calloc(ma->nfmt_map*files->nreaders, sizeof(bcf_fmt_t*));
+        ma->fmt_key  = (const char**) malloc(ma->nfmt_map*sizeof(*ma->fmt_key));
     }
     else
         memset(ma->fmt_map, 0, ma->nfmt_map*files->nreaders*sizeof(bcf_fmt_t**));
@@ -2250,7 +2439,7 @@ void merge_format(args_t *args, bcf1_t *out)
         bcf_hdr_t *hdr = reader->header;
         for (j=0; j<line->n_fmt; j++)
         {
-            // Wat this tag already seen?
+            // Was this tag already seen?
             bcf_fmt_t *fmt = &line->d.fmt[j];
             const char *key = hdr->id[BCF_DT_ID][fmt->id].key;
             kitr = kh_get(strdict, tmph, key);
@@ -2269,9 +2458,11 @@ void merge_format(args_t *args, bcf1_t *out)
                     {
                         ma->fmt_map = (bcf_fmt_t**) realloc(ma->fmt_map, sizeof(bcf_fmt_t*)*(max_ifmt+1)*files->nreaders);
                         memset(ma->fmt_map+ma->nfmt_map*files->nreaders, 0, (max_ifmt-ma->nfmt_map+1)*files->nreaders*sizeof(bcf_fmt_t*));
+                        ma->fmt_key = (const char**) realloc(ma->fmt_key, sizeof(*ma->fmt_key)*(max_ifmt+1));
                         ma->nfmt_map = max_ifmt+1;
                     }
                     if ( key[0]=='P' && key[1]=='L' && key[2]==0  ) { has_PL = ifmt; }
+                    ma->fmt_key[max_ifmt] = key;
                 }
                 kitr = kh_put(strdict, tmph, key, &ret);
                 kh_value(tmph, kitr) = ifmt;
@@ -2298,7 +2489,10 @@ void merge_format(args_t *args, bcf1_t *out)
         update_AN_AC(out_hdr, out);
 
     for (i=1; i<=max_ifmt; i++)
-        merge_format_field(args, &ma->fmt_map[i*files->nreaders], out);
+    {
+        missing_rule_t *rule = (missing_rule_t*) bsearch(ma->fmt_key[i], args->missing_rules, args->nmissing_rules, sizeof(*args->missing_rules), missing_rules_comp_key);
+        merge_format_field(args, &ma->fmt_map[i*files->nreaders], rule, out);
+    }
 
     if ( ma->laa_dirty )
         update_local_alleles(args, out);
@@ -2406,6 +2600,9 @@ void gvcf_write_block(args_t *args, int start, int end)
     {
         int slen  = 0;
         char *seq = faidx_fetch_seq(args->gvcf_fai,maux->chr,out->pos,out->pos,&slen);
+        if (!seq)
+            exit(1); // faidx_fetch_seq has already reported the error.
+
         if (slen)
         {
             out->d.allele[0][0] = seq[0];
@@ -2421,9 +2618,19 @@ void gvcf_write_block(args_t *args, int start, int end)
     }
     else
         bcf_update_info_int32(args->out_hdr, out, "END", NULL, 0);
+
+    int iunseen;
+    if ( args->trim_star_allele && (out->n_allele > 2 || args->trim_star_allele > 1) && (iunseen=get_unseen_allele(out)) && iunseen>0 )
+    {
+        // the unobserved star allele should be trimmed, either it is variant site or trimming of all sites was requested
+        kbitset_t *rm_set = kbs_init(out->n_allele);
+        kbs_insert(rm_set, iunseen);
+        if ( bcf_remove_allele_set(args->out_hdr,out,rm_set) )
+            error("[%s] Error: failed to trim the unobserved allele at %s:%"PRIhts_pos"\n",__func__,bcf_seqname(args->out_hdr,out),out->pos+1);
+        kbs_destroy(rm_set);
+    }
     if ( bcf_write1(args->out_fh, args->out_hdr, out)!=0 ) error("[%s] Error: cannot write to %s\n", __func__,args->output_fname);
     bcf_clear1(out);
-
 
     // Inactivate blocks which do not extend beyond END and find new gvcf_min
     min = INT_MAX;
@@ -2519,16 +2726,6 @@ static inline int is_gvcf_block(bcf1_t *line)
     }
     return 0;
 }
-
-// Lines can come with any combination of variant types. We use a subset of types defined in vcf.h
-// but shift by two bits to account for VCF_REF defined as 0 (design flaw in vcf.h, my fault) and
-// to accommodate for VCF_GVCF_REF defined below
-static const int
-    snp_mask = (VCF_SNP<<2)|(VCF_MNP<<2),
-    indel_mask = VCF_INDEL<<2,
-    ins_mask = VCF_INS<<2,
-    del_mask = VCF_DEL<<2,
-    ref_mask = 2;
 
 /*
     Check incoming lines for new gVCF blocks, set pointer to the current source
@@ -2629,7 +2826,7 @@ void clean_buffer(args_t *args)
         {
             if ( ma->gvcf[ir].active )
             {
-                if ( ma->pos >= ma->gvcf[ir].end )  ma->gvcf[ir].active = 0;
+                if ( ma->pos > ma->gvcf[ir].end )  ma->gvcf[ir].active = 0;
                 else if ( ma->buf[ir].cur==-1 ) ma->buf[ir].cur = ma->buf[ir].beg;  // re-activate interrupted gVCF block
             }
             if ( !ma->gvcf[ir].active ) ma->buf[ir].cur = -1;
@@ -2664,13 +2861,16 @@ void debug_maux(args_t *args)
     {
         bcf_sr_t *reader = &files->readers[j];
         buffer_t *buf = &maux->buf[j];
-        fprintf(stderr," reader %d: ", j);
+        fprintf(stderr," reader %d (k=%d-%d): ", j,buf->beg,buf->end);
         for (k=buf->beg; k<buf->end; k++)
         {
-            if ( buf->rec[k].skip & SKIP_DONE ) continue;
-            bcf1_t *line = reader->buffer[k];
+            if ( buf->rec[k].skip & SKIP_DONE ) { fprintf(stderr," DONE"); continue; }
+            bcf1_t *line = reader->buffer[k];               // selected for merging by can_merge
             fprintf(stderr,"\t");
-            if ( buf->rec[k].skip ) fprintf(stderr,"[");  // this record will not be merged in this round
+            if ( buf->cur==k ) fprintf(stderr,"!");         // selected for merging by stage_line
+            if ( buf->rec[k].skip ) fprintf(stderr,"[");    // this record cannot be merged in this round
+            if ( !line->n_allele && maux->gvcf[j].active )
+                fprintf(stderr,"<*>");
             for (l=0; l<line->n_allele; l++)
                 fprintf(stderr,"%s%s", l==0?"":",", line->d.allele[l]);
             if ( buf->rec[k].skip ) fprintf(stderr,"]");
@@ -2686,9 +2886,10 @@ void debug_state(args_t *args)
 {
     maux_t *maux = args->maux;
     int i,j;
+    fprintf(stderr,"State after position=%d done:\n",maux->pos+1);
     for (i=0; i<args->files->nreaders; i++)
     {
-        fprintf(stderr,"reader %d:\tcur,beg,end=% d,%d,%d", i,maux->buf[i].cur,maux->buf[i].beg,maux->buf[i].end);
+        fprintf(stderr,"\treader %d:\tcur,beg,end=% d,%d,%d", i,maux->buf[i].cur,maux->buf[i].beg,maux->buf[i].end);
         if ( maux->buf[i].cur >=0 )
         {
             bcf_hdr_t *hdr = bcf_sr_get_header(args->files,i);
@@ -2698,20 +2899,136 @@ void debug_state(args_t *args)
         }
         fprintf(stderr,"\n");
     }
-    fprintf(stderr,"gvcf_min=%d\n", args->maux->gvcf_min);
+    fprintf(stderr,"\tgvcf_min=%d\n", args->maux->gvcf_min);
     for (i=0; i<args->files->nreaders; i++)
     {
-        fprintf(stderr,"reader %d:\tgvcf_active=%d", i,maux->gvcf[i].active);
+        fprintf(stderr,"\t\treader %d:\tgvcf_active=%d", i,maux->gvcf[i].active);
         if ( maux->gvcf[i].active ) fprintf(stderr,"\tpos,end=%"PRId64",%"PRId64, (int64_t) maux->gvcf[i].line->pos+1,(int64_t) maux->gvcf[i].end+1);
         fprintf(stderr,"\n");
     }
     fprintf(stderr,"\n");
 }
 
+
+// Lines can come with any combination of variant types. We use a subset of types defined in vcf.h
+// but shift by two bits to account for VCF_REF defined as 0 (design flaw in vcf.h, my fault)
+static const int
+    snp_mask   = (VCF_SNP<<1)|(VCF_MNP<<1),
+    indel_mask = (VCF_INDEL<<1),
+    ins_mask   = VCF_INS<<1,
+    del_mask   = VCF_DEL<<1,
+    ref_mask   = 1;
+
+// Can these types be merged given the -m settings? Despite the function's name, its focus is on
+// excluding incompatible records, there will be a finer matching later in stage_line()
+static inline int types_compatible(args_t *args, int selected_types, buffer_t *buf, int irec)
+{
+    int k;
+    maux_t *maux = args->maux;
+    bcf1_t *rec = buf->lines[irec];
+    int rec_types = buf->rec[irec].var_types;
+
+    assert( selected_types );   // this is trivially true, set in can_merge()
+
+    if ( args->collapse & COLLAPSE_ANY ) return 1;  // can merge anything with anything
+
+    // REF and gVCF_REF with no other alleles present can be merged with anything
+    if ( (selected_types&ref_mask) && !(selected_types&(~ref_mask)) ) return 1;
+    if ( (rec_types&ref_mask) && !(rec_types&(~ref_mask)) ) return 1;
+
+    if ( args->collapse!=COLLAPSE_NONE )
+    {
+        // If we are here, one the following modes must have been set: both,snps,indels,snp-ins-del
+        // Include the new record if
+        //  - rec has SNV, we already have SNV, and -m is both,snps,snp-ins-del
+        //  - rec has indel, we already have an indel, and -m both,indels,snp-ins-del
+        if ( args->collapse&(COLLAPSE_SNPS|COLLAPSE_SNP_INS_DEL) )
+        {
+            if ( (rec_types&snp_mask) && (selected_types&snp_mask) ) return 1;
+        }
+        if ( args->collapse&COLLAPSE_INDELS )
+        {
+            if ( (rec_types&indel_mask) && (selected_types&indel_mask) ) return 1;
+        }
+        if ( args->collapse&COLLAPSE_SNP_INS_DEL )
+        {
+            if ( (rec_types&ins_mask) && (selected_types&ins_mask) ) return 1;
+            if ( (rec_types&del_mask) && (selected_types&del_mask) ) return 1;
+        }
+        // Whatever is left, allow to match if the alleles match exactly
+    }
+
+    // The -m none mode or exact matching requested
+    // Simple test first: are the variants of the same type?
+    int x = selected_types >> 1;        // remove REF
+    int y = rec_types >> 1;             // remove REF
+    while ( x && y ) { x>>=1; y>>=1; }
+    if ( x || y ) return 0;             // the types differ
+
+    if ( vcmp_set_ref(args->vcmp,maux->als[0],rec->d.allele[0]) < 0 ) return 0;   // refs are not compatible
+    for (k=1; k<rec->n_allele; k++)
+    {
+        if ( bcf_has_variant_type(rec,k,VCF_REF) ) continue;    // this must be gVCF_REF (<*> or <NON_REF>)
+        if ( vcmp_find_allele(args->vcmp,maux->als+1,maux->nals-1,rec->d.allele[k])>=0 ) break;
+    }
+    if ( k==rec->n_allele ) return 0;   // this record has a new allele rec->d.allele[k]
+    return 1;   // all alleles in rec are also in the records selected thus far, perhaps save for gVCF_REF
+}
+
+static void maux_update_alleles(args_t *args, int ireader, int irec)
+{
+    int k;
+    bcf_sr_t *reader = &args->files->readers[ireader];
+    maux_t *maux = args->maux;
+    buffer_t *buf = &maux->buf[ireader];
+    maux1_t *ma1 = &buf->rec[irec];
+    bcf1_t *line = buf->lines[irec];
+    hts_expand(int, line->n_allele, ma1->mmap, ma1->map);
+    if ( !maux->nals )  // first record to be merged, copy the alleles to the output
+    {
+        maux->nals = line->n_allele;
+        hts_expand0(char*, maux->nals, maux->mals, maux->als);
+        hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
+        hts_expand0(int, maux->nals, maux->mals_types, maux->als_types);
+        for (k=0; k<maux->nals; k++)
+        {
+            free(maux->als[k]);
+            maux->als[k] = strdup(line->d.allele[k]);
+            ma1->map[k]  = k;
+            maux->cnt[k] = 1;
+            int var_type = bcf_has_variant_type(line, k, VCF_ANY);
+            if ( args->collapse==COLLAPSE_SNP_INS_DEL ) var_type &= ~VCF_INDEL;
+            maux->als_types[k] = var_type ? var_type<<1 : ref_mask;
+        }
+        return;
+    }
+    // normalize alleles
+    maux->als = merge_alleles(line->d.allele, line->n_allele, ma1->map, maux->als, &maux->nals, &maux->mals);
+    if ( !maux->als ) error("Failed to merge alleles at %s:%"PRId64" in %s\n",maux->chr,(int64_t) line->pos+1,reader->fname);
+    hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
+    hts_expand0(int, maux->nals, maux->mals_types, maux->als_types);
+    for (k=1; k<line->n_allele; k++)
+    {
+        int ik = ma1->map[k];
+        int var_type = bcf_has_variant_type(line, k, VCF_ANY);
+        if ( args->collapse==COLLAPSE_SNP_INS_DEL ) var_type &= ~VCF_INDEL;
+        maux->als_types[ik] = var_type ? var_type<<1 : ref_mask;
+        maux->cnt[ik]++;    // how many times an allele appears in the files
+    }
+    maux->cnt[0]++;
+}
+
 /*
-   Determine which line should be merged from which reader: go through all
-   readers and all buffered lines, expand REF,ALT and try to match lines with
-   the same ALTs.
+   Determine which lines remain to be merged across readers at the current position and
+   are compatible given the -m criteria. This is indicated by maux1_t.skip: 0=compatible,
+   SKIP_DONE=the record is done, SKIP_DIFF=not compatible and will be included next time.
+
+   At the same time count how many times is each allele present across the readers and records
+   so that we can prioritize the records with the same alleles to come first. In the end maximum
+   one record at a time can be selected from each reader and that witll be done in stage_line().
+
+   The function maux_reset already initialized structures for this position, so here each
+   reader comes with the beg,end indexes that point to records with the same maux_t.pos position.
  */
 int can_merge(args_t *args)
 {
@@ -2719,28 +3036,39 @@ int can_merge(args_t *args)
     maux_t *maux = args->maux;
     gvcf_aux_t *gaux = maux->gvcf;
     char *id = NULL, ref = 'N';
-    int i,j,k, ntodo = 0;
+    int i,j, ntodo = 0;
 
     for (i=0; i<maux->nals; i++)
     {
         free(maux->als[i]);
         maux->als[i] = NULL;
+        maux->cnt[i] = 0;
     }
     maux->var_types = maux->nals = 0;
 
-    // this is only for the `-m none -g` mode, ensure that <*> lines come last
-    #define VCF_GVCF_REF 1
-
+    // In this loop we do the following:
+    //  - remember the first encountered ID if matching by ID
+    //  - count the number of unprocessed records at this position
+    //  - collect all variant types at this position. This is to be able to perform -m matching and
+    //    print SNVs first, then indels, then gVCF blocks
+    //  - init the 'skip' variable to SKIP_DIFF for each record that has not been used yet
     for (i=0; i<files->nreaders; i++)
     {
         buffer_t *buf = &maux->buf[i];
+        buf->var_types = 0;
 
-        if ( gaux && gaux[i].active )
+        if ( gaux && gaux[i].active ) // active gvcf block
         {
-            // skip readers with active gvcf blocks
             buf->rec[buf->beg].skip = SKIP_DIFF;
+            maux->var_types |= ref_mask;
+            buf->var_types |= ref_mask;
+            buf->rec[buf->beg].var_types = ref_mask;
             continue;
         }
+
+        // for gvcf: find out REF at this position
+        if ( buf->beg < buf->end && ref=='N' ) ref = buf->lines[buf->beg]->d.allele[0][0];
+
         for (j=buf->beg; j<buf->end; j++)
         {
             if ( buf->rec[j].skip & SKIP_DONE ) continue;
@@ -2749,30 +3077,28 @@ int can_merge(args_t *args)
             ntodo++;
 
             bcf1_t *line = buf->lines[j];
-            if ( args->merge_by_id )
-                id = line->d.id;
-            else
+            if ( args->merge_by_id && !id ) { id = line->d.id; continue; }      // set ID when merging by id
+
+            if ( !buf->rec[j].var_types )
             {
                 int var_type = bcf_has_variant_types(line, VCF_ANY, bcf_match_overlap);
-                if (var_type < 0) error("bcf_has_variant_types() failed.");
+                if ( var_type < 0 ) error("bcf_has_variant_types() failed.");
                 if ( args->collapse==COLLAPSE_SNP_INS_DEL )
                 {
                     // need to distinguish between ins and del so strip the VCF_INDEL flag
                     var_type &= ~VCF_INDEL;
                 }
-                maux->var_types |= var_type ? var_type<<2 : 2;
-
-                // for the `-m none -g` mode
-                if ( args->collapse==COLLAPSE_NONE && args->do_gvcf && is_gvcf_block(line) )
-                    maux->var_types |= VCF_GVCF_REF;
+                var_type = var_type ? var_type<<1 : ref_mask;
+                if ( args->do_gvcf && is_gvcf_block(line) ) var_type |= ref_mask;
+                buf->rec[j].var_types = var_type;
             }
+            maux->var_types |= buf->rec[j].var_types;
+            buf->var_types |= buf->rec[j].var_types;
         }
-
-        // for gvcf: find out REF at this position
-        if ( buf->beg < buf->end && ref=='N' )
-            ref = buf->lines[buf->beg]->d.allele[0][0];
     }
     if ( !ntodo ) return 0;
+
+    int selected_types = 0;
 
     // In this loop we select from each reader compatible candidate lines.
     // (i.e. SNPs or indels). Go through all files and all lines at this
@@ -2780,87 +3106,41 @@ int can_merge(args_t *args)
     // REF-only sites may be associated with both SNPs and indels.
     for (i=0; i<files->nreaders; i++)
     {
-        bcf_sr_t *reader = &files->readers[i];
         buffer_t *buf = &maux->buf[i];
-
         if ( gaux && gaux[i].active )
         {
+            // gVCF records inherited from an upstream gVCF block have incorrect or missing allele and position
             gaux[i].line->d.allele[0][0] = ref;
             gaux[i].line->pos = maux->pos;
+            maux_update_alleles(args, i, buf->beg);
+            selected_types |= ref_mask;
+            continue;
         }
-
         for (j=buf->beg; j<buf->end; j++)
         {
             if ( buf->rec[j].skip & SKIP_DONE ) continue;
 
             bcf1_t *line = buf->lines[j]; // ptr to reader's buffer or gvcf buffer
-
-            int line_type = bcf_has_variant_types(line, VCF_ANY, bcf_match_overlap);
-            if (line_type < 0) error("bcf_has_variant_types() failed.");
-            line_type = line_type ? line_type<<2 : 2;
+            int line_types = buf->rec[j].var_types;
 
             // select relevant lines
             if ( args->merge_by_id )
             {
-                if ( strcmp(id,line->d.id) ) continue;
+                if ( strcmp(id,line->d.id) ) continue;      // matching by ID and it does not match the selected record
             }
+            else if ( selected_types && !types_compatible(args,selected_types,buf,j) ) continue;
             else
             {
-                // when merging gVCF in -m none mode, make sure that gVCF blocks with the same POS as variant
-                // records come last, otherwise infinite loop is created (#1164)
-                if ( args->collapse==COLLAPSE_NONE && args->do_gvcf )
-                {
-                    if ( is_gvcf_block(line) && (maux->var_types & (~(VCF_GVCF_REF|2))) ) continue;
-                }
-                if ( args->collapse==COLLAPSE_NONE && maux->nals )
-                {
-                    // All alleles of the tested record must be present in the
-                    // selected maux record plus variant types must be the same
-                    if ( (maux->var_types & line_type) != line_type ) continue;
-                    if ( vcmp_set_ref(args->vcmp,maux->als[0],line->d.allele[0]) < 0 ) continue;   // refs not compatible
-                    for (k=1; k<line->n_allele; k++)
-                    {
-                        if ( vcmp_find_allele(args->vcmp,maux->als+1,maux->nals-1,line->d.allele[k])>=0 ) break;
-                    }
-                    if ( !(line_type&ref_mask) && k==line->n_allele ) continue;  // not a REF-only site and there is no matching allele
-                }
-                if ( !(args->collapse&COLLAPSE_ANY) )
-                {
-                    // Merge:
-                    //  - SNPs+SNPs+MNPs+REF if -m both,snps
-                    //  - indels+indels+REF  if -m both,indels, REF only if SNPs are not present
-                    //  - SNPs come first
-                    if ( line_type & (indel_mask|ins_mask|del_mask) )
-                    {
-                        if ( !(line_type&snp_mask) && maux->var_types&snp_mask ) continue;  // SNPs come first
-                        if ( args->do_gvcf && maux->var_types&ref_mask ) continue;  // never merge indels with gVCF blocks
-                    }
-                }
+                // First time here, choosing the first line: prioritize SNPs when available in the -m snps,both modes
+                if ( (args->collapse&COLLAPSE_SNPS || args->collapse==COLLAPSE_NONE)     // asked to merge SNVs into multiallelics
+                        && (maux->var_types&snp_mask)                   // there are SNVs at the current position
+                        && !(buf->rec[j].var_types&(snp_mask|ref_mask)) // and this record is not a SNV nor ref
+                   ) continue;
             }
-            buf->rec[j].skip = 0;
+            selected_types |= line_types;
 
-            hts_expand(int, line->n_allele, buf->rec[j].mmap, buf->rec[j].map);
-            if ( !maux->nals )    // first record, copy the alleles to the output
-            {
-                maux->nals = line->n_allele;
-                hts_expand0(char*, maux->nals, maux->mals, maux->als);
-                hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
-                for (k=0; k<maux->nals; k++)
-                {
-                    free(maux->als[k]);
-                    maux->als[k] = strdup(line->d.allele[k]);
-                    buf->rec[j].map[k] = k;
-                    maux->cnt[k] = 1;
-                }
-                continue;
-            }
-            // normalize alleles
-            maux->als = merge_alleles(line->d.allele, line->n_allele, buf->rec[j].map, maux->als, &maux->nals, &maux->mals);
-            if ( !maux->als ) error("Failed to merge alleles at %s:%"PRId64" in %s\n",maux->chr,(int64_t) line->pos+1,reader->fname);
-            hts_expand0(int, maux->nals, maux->ncnt, maux->cnt);
-            for (k=1; k<line->n_allele; k++)
-                maux->cnt[ buf->rec[j].map[k] ]++;    // how many times an allele appears in the files
-            maux->cnt[0]++;
+            buf->rec[j].skip = 0;   // the j-th record from i-th reader can be included. Final decision will be made in stage_line
+            maux_update_alleles(args, i, j);
         }
     }
     return 1;
@@ -2878,48 +3158,61 @@ void stage_line(args_t *args)
     bcf_srs_t *files = args->files;
     maux_t *maux = args->maux;
 
-    // debug_maux(args);
-
-    // take the most frequent allele present in multiple files, REF is skipped
-    int i,j,k,icnt = 1;
-    for (i=2; i<maux->nals; i++)
-        if ( maux->cnt[i] > maux->cnt[icnt] ) icnt = i;
+    // Take the most frequent allele present in multiple files, REF and gVCF_REF is skipped.
+    int i,j,k,icnt = -1;
+    for (i=1; i<maux->nals; i++)
+    {
+        if ( maux->als_types[i] & ref_mask ) continue;
+        if ( icnt==-1 || maux->cnt[icnt] < maux->cnt[i] ) icnt = i;
+    }
+    int selected_type = icnt>0 ? maux->als_types[icnt] : ref_mask;
 
     int nout = 0;
     for (i=0; i<files->nreaders; i++)
     {
         buffer_t *buf = &maux->buf[i];
         buf->cur = -1;
-        if ( buf->beg >= buf->end ) continue;   // no lines in the buffer
+        if ( buf->beg >= buf->end ) continue; // No lines in the buffer at this site
 
         // find lines with the same allele
         for (j=buf->beg; j<buf->end; j++)
         {
-            if ( buf->rec[j].skip ) continue;   // done or not compatible
-            if ( args->merge_by_id ) break;
-            if ( maux->nals==1 && buf->lines[j]->n_allele==1 ) break;   // REF-only record
+            if ( buf->rec[j].skip )
+            {
+                int is_gvcf = maux->gvcf && maux->gvcf[i].active ? 1 : 0;
+                if ( !is_gvcf && is_gvcf_block(buf->lines[j]) ) is_gvcf = 1;
+                if ( !is_gvcf ) continue;   // done or not compatible
+            }
+            if ( args->merge_by_id ) break;     // if merging by ID and the line is compatible, the this is THE line
 
+            // skip if the reader has a record that matches the most frequent allele and this record is not it
+            if ( (selected_type & buf->var_types) && !(selected_type & buf->rec[j].var_types) ) continue;
+
+            // if the reader does not have the most frequent allele type but is a ref, accept
+            if ( !(selected_type & buf->var_types) && (buf->rec[j].var_types & ref_mask) ) break;
+            if ( selected_type==ref_mask ) break;
+
+            // accept if the record has the most frequent allele
             for (k=0; k<buf->lines[j]->n_allele; k++)
                 if ( icnt==buf->rec[j].map[k] ) break;
-
             if ( k<buf->lines[j]->n_allele ) break;
         }
         if ( j>=buf->end )
         {
             // no matching allele found in this file
-            if ( args->collapse==COLLAPSE_NONE ) continue;
+            if ( args->collapse==COLLAPSE_NONE ) continue;  // exact matching requested, skip
 
+            // choose something compatible to create a multiallelic site given the -m criteria
             for (j=buf->beg; j<buf->end; j++)
             {
                 if ( buf->rec[j].skip ) continue;   // done or not compatible
                 if ( args->collapse&COLLAPSE_ANY ) break;   // anything can be merged
-                int line_type = bcf_has_variant_types(buf->lines[j], VCF_ANY, bcf_match_overlap);
-                if (line_type < 0) error("bcf_has_variant_types() failed.");
-                if ( maux->var_types&snp_mask && line_type&VCF_SNP && (args->collapse&COLLAPSE_SNPS) ) break;
-                if ( maux->var_types&indel_mask && line_type&VCF_INDEL && (args->collapse&COLLAPSE_INDELS) ) break;
-                if ( maux->var_types&ins_mask && line_type&VCF_INS && (args->collapse&COLLAPSE_SNP_INS_DEL) ) break;
-                if ( maux->var_types&del_mask && line_type&VCF_DEL && (args->collapse&COLLAPSE_SNP_INS_DEL) ) break;
-                if ( line_type==VCF_REF )
+                int line_type = buf->rec[j].var_types;
+                if ( maux->var_types&snp_mask && line_type&snp_mask && (args->collapse&COLLAPSE_SNPS) ) break;
+                if ( maux->var_types&indel_mask && line_type&indel_mask && (args->collapse&COLLAPSE_INDELS) ) break;
+                if ( maux->var_types&ins_mask && line_type&ins_mask && (args->collapse&COLLAPSE_SNP_INS_DEL) ) break;
+                if ( maux->var_types&del_mask && line_type&del_mask && (args->collapse&COLLAPSE_SNP_INS_DEL) ) break;
+                if ( line_type&ref_mask )
                 {
                     if ( maux->var_types&snp_mask && (args->collapse&COLLAPSE_SNPS) ) break;
                     if ( maux->var_types&indel_mask && (args->collapse&COLLAPSE_INDELS) ) break;
@@ -2940,12 +3233,21 @@ void stage_line(args_t *args)
         {
             // found a suitable line for merging
             buf->cur = j;
-
-            // mark as finished so that it's ignored next time
-            buf->rec[j].skip  = SKIP_DONE;
-            nout++;
         }
     }
+
+    // debug_maux(args);
+
+    // Mark lines staged for merging as finished so that they are ignored next time
+    for (i=0; i<files->nreaders; i++)
+    {
+        buffer_t *buf = &maux->buf[i];
+        if ( buf->cur == -1 ) continue;
+
+        buf->rec[buf->cur].skip  = SKIP_DONE;
+        nout++;
+    }
+
     assert( nout );
 }
 
@@ -2959,6 +3261,16 @@ void merge_line(args_t *args)
     if ( args->do_gvcf )
         bcf_update_info_int32(args->out_hdr, out, "END", NULL, 0);
     merge_format(args, out);
+    int iunseen;
+    if ( args->trim_star_allele && (out->n_allele > 2 || args->trim_star_allele > 1) && (iunseen=get_unseen_allele(out)) && iunseen>0 )
+    {
+        // the unobserved star allele should be trimmed, either it is variant site or trimming of all sites was requested
+        kbitset_t *rm_set = kbs_init(out->n_allele);
+        kbs_insert(rm_set, iunseen);
+        if ( bcf_remove_allele_set(args->out_hdr,out,rm_set) )
+            error("[%s] Error: failed to trim the unobserved allele at %s:%"PRIhts_pos"\n",__func__,bcf_seqname(args->out_hdr,out),out->pos+1);
+        kbs_destroy(rm_set);
+    }
     if ( bcf_write1(args->out_fh, args->out_hdr, out)!=0 ) error("[%s] Error: cannot write to %s\n", __func__,args->output_fname);
     bcf_clear1(out);
 }
@@ -3078,6 +3390,7 @@ void merge_vcf(args_t *args)
             error_errno("[%s] Failed to update header", __func__);
     }
     info_rules_init(args);
+    missing_rules_init(args);
 
     bcf_hdr_set_version(args->out_hdr, bcf_hdr_get_version(args->files->readers[0].header));
     if ( bcf_hdr_write(args->out_fh, args->out_hdr)!=0 ) error("[%s] Error: cannot write to %s\n", __func__,args->output_fname);
@@ -3087,8 +3400,11 @@ void merge_vcf(args_t *args)
         if ( hts_close(args->out_fh)!=0 ) error("[%s] Error: close failed .. %s\n", __func__,args->output_fname);
         return;
     }
+    else if ( init_index2(args->out_fh,args->out_hdr,args->output_fname,
+                          &args->index_fn, args->write_index)<0 )
+        error("Error: failed to initialise index for %s\n",args->output_fname);
 
-    if ( args->collapse==COLLAPSE_NONE ) args->vcmp = vcmp_init();
+    args->vcmp = vcmp_init();
     args->maux = maux_init(args);
     args->out_line = bcf_init1();
     args->tmph = kh_init(strdict);
@@ -3122,9 +3438,19 @@ void merge_vcf(args_t *args)
         gvcf_flush(args,1);
 
     info_rules_destroy(args);
+    missing_rules_destroy(args);
     maux_destroy(args->maux);
     bcf_hdr_destroy(args->out_hdr);
-    if ( hts_close(args->out_fh)!=0 ) error("[%s] Error: close failed .. %s\n", __func__,args->output_fname);
+    if ( args->write_index )
+    {
+        if ( bcf_idx_save(args->out_fh)<0 )
+        {
+            if ( hts_close(args->out_fh)!=0 ) error("Error: close failed .. %s\n", args->output_fname?args->output_fname:"stdout");
+            error("Error: cannot write to index %s\n", args->index_fn);
+        }
+        free(args->index_fn);
+    }
+    if ( hts_close(args->out_fh)!=0 ) error("[%s] Error: close failed .. %s\n", __func__,args->output_fname?args->output_fname:"stdout");
     bcf_destroy1(args->out_line);
     kh_destroy(strdict, args->tmph);
     if ( args->tmps.m ) free(args->tmps.s);
@@ -3140,17 +3466,20 @@ static void usage(void)
     fprintf(stderr, "Usage:   bcftools merge [options] <A.vcf.gz> <B.vcf.gz> [...]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
+    fprintf(stderr, "        --force-no-index              Merge unindexed files, synonymous to --no-index\n");
     fprintf(stderr, "        --force-samples               Resolve duplicate sample names\n");
+    fprintf(stderr, "        --force-single                Run even if there is only one file on input\n");
     fprintf(stderr, "        --print-header                Print only the merged header and exit\n");
     fprintf(stderr, "        --use-header FILE             Use the provided header\n");
     fprintf(stderr, "    -0  --missing-to-ref              Assume genotypes at missing sites are 0/0\n");
     fprintf(stderr, "    -f, --apply-filters LIST          Require at least one of the listed FILTER strings (e.g. \"PASS,.\")\n");
     fprintf(stderr, "    -F, --filter-logic x|+            Remove filters if some input is PASS (\"x\"), or apply all filters (\"+\") [+]\n");
-    fprintf(stderr, "    -g, --gvcf -|REF.FA               Merge gVCF blocks, INFO/END tag is expected. Implies -i QS:sum,MinDP:min,I16:sum,IDV:max,IMF:max\n");
+    fprintf(stderr, "    -g, --gvcf -|REF.FA               Merge gVCF blocks, INFO/END tag is expected. Implies -i QS:sum,MinDP:min,MIN_DP:min,I16:sum,IDV:max,IMF:max -M PL:max,AD:0\n");
     fprintf(stderr, "    -i, --info-rules TAG:METHOD,..    Rules for merging INFO fields (method is one of sum,avg,min,max,join) or \"-\" to turn off the default [DP:sum,DP4:sum]\n");
     fprintf(stderr, "    -l, --file-list FILE              Read file names from the file\n");
-    fprintf(stderr, "    -L, --local-alleles INT           EXPERIMENTAL: if more than <int> ALT alleles are encountered, drop FMT/PL and output LAA+LPL instead; 0=unlimited [0]\n");
-    fprintf(stderr, "    -m, --merge STRING                Allow multiallelic records for <snps|indels|both|snp-ins-del|all|none|id>, see man page for details [both]\n");
+    fprintf(stderr, "    -L, --local-alleles INT           If more than INT alt alleles are encountered, drop FMT/PL and output LAA+LPL instead; 0=unlimited [0]\n");
+    fprintf(stderr, "    -m, --merge STRING[*|**]          Allow multiallelic records for snps,indels,both,snp-ins-del,all,none,id,*,**; see man page for details [both]\n");
+    fprintf(stderr, "    -M, --missing-rules TAG:METHOD    Rules for replacing missing values in numeric vectors (.,0,max) when unknown allele <*> is not present [.]\n");
     fprintf(stderr, "        --no-index                    Merge unindexed files, the same chromosomal order is required and -r/-R are not allowed\n");
     fprintf(stderr, "        --no-version                  Do not append version and command line to the header\n");
     fprintf(stderr, "    -o, --output FILE                 Write output to a file [standard output]\n");
@@ -3158,7 +3487,8 @@ static void usage(void)
     fprintf(stderr, "    -r, --regions REGION              Restrict to comma-separated list of regions\n");
     fprintf(stderr, "    -R, --regions-file FILE           Restrict to regions listed in a file\n");
     fprintf(stderr, "        --regions-overlap 0|1|2       Include if POS in the region (0), record overlaps (1), variant overlaps (2) [1]\n");
-    fprintf(stderr, "        --threads INT                 Use multithreading with <int> worker threads [0]\n");
+    fprintf(stderr, "        --threads INT                 Use multithreading with INT worker threads [0]\n");
+    fprintf(stderr, "    -W, --write-index[=FMT]           Automatically index the output files [off]\n");
     fprintf(stderr, "\n");
     exit(1);
 }
@@ -3197,13 +3527,17 @@ int main_vcfmerge(int argc, char *argv[])
         {"regions-file",required_argument,NULL,'R'},
         {"regions-overlap",required_argument,NULL,4},
         {"info-rules",required_argument,NULL,'i'},
+        {"missing-rules",required_argument,NULL,'M'},
         {"no-version",no_argument,NULL,8},
         {"no-index",no_argument,NULL,10},
+        {"force-no-index",no_argument,NULL,10},
+        {"force-single",no_argument,NULL,12},
         {"filter-logic",required_argument,NULL,'F'},
+        {"write-index",optional_argument,NULL,'W'},
         {NULL,0,NULL,0}
     };
     char *tmp;
-    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:l:g:F:0L:",loptions,NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "hm:f:r:R:o:O:i:M:l:g:F:0L:W::",loptions,NULL)) >= 0) {
         switch (c) {
             case 'L':
                 args->local_alleles = strtol(optarg,&tmp,10);
@@ -3227,6 +3561,7 @@ int main_vcfmerge(int argc, char *argv[])
                 break;
             case 'l': args->file_list = optarg; break;
             case 'i': args->info_rules = optarg; break;
+            case 'M': args->missing_rules_str = optarg; break;
             case 'o': args->output_fname = optarg; break;
             case 'O':
                 switch (optarg[0]) {
@@ -3247,17 +3582,23 @@ int main_vcfmerge(int argc, char *argv[])
                 }
                 break;
             case 'm':
+            {
+                int len = strlen(optarg);
+                if ( optarg[len-1]=='*' ) { args->trim_star_allele++; len--; }
+                if ( optarg[len-1]=='*' ) { args->trim_star_allele++; len--; }
+                if ( optarg[len-1]==',' ) len--;
                 args->collapse = COLLAPSE_NONE;
-                if ( !strcmp(optarg,"snps") ) args->collapse |= COLLAPSE_SNPS;
-                else if ( !strcmp(optarg,"indels") ) args->collapse |= COLLAPSE_INDELS;
-                else if ( !strcmp(optarg,"both") ) args->collapse |= COLLAPSE_BOTH;
-                else if ( !strcmp(optarg,"any") ) args->collapse |= COLLAPSE_ANY;
-                else if ( !strcmp(optarg,"all") ) args->collapse |= COLLAPSE_ANY;
-                else if ( !strcmp(optarg,"none") ) args->collapse = COLLAPSE_NONE;
-                else if ( !strcmp(optarg,"snp-ins-del") ) args->collapse = COLLAPSE_SNP_INS_DEL;
-                else if ( !strcmp(optarg,"id") ) { args->collapse = COLLAPSE_NONE; args->merge_by_id = 1; }
+                if ( !strncmp(optarg,"snp-ins-del",len) ) args->collapse = COLLAPSE_SNP_INS_DEL|COLLAPSE_SNPS;
+                else if ( !strncmp(optarg,"snps",len) ) args->collapse |= COLLAPSE_SNPS;
+                else if ( !strncmp(optarg,"indels",len) ) args->collapse |= COLLAPSE_INDELS;
+                else if ( !strncmp(optarg,"id",len) ) { args->collapse = COLLAPSE_NONE; args->merge_by_id = 1; }
+                else if ( !strncmp(optarg,"any",len) ) args->collapse |= COLLAPSE_ANY;
+                else if ( !strncmp(optarg,"all",len) ) args->collapse |= COLLAPSE_ANY;
+                else if ( !strncmp(optarg,"both",len) ) args->collapse |= COLLAPSE_BOTH;
+                else if ( !strncmp(optarg,"none",len) ) args->collapse = COLLAPSE_NONE;
                 else error("The -m type \"%s\" is not recognised.\n", optarg);
                 break;
+            }
             case 'f': args->files->apply_filters = optarg; break;
             case 'r': args->regions_list = optarg; break;
             case 'R': args->regions_list = optarg; regions_is_file = 1; break;
@@ -3271,14 +3612,17 @@ int main_vcfmerge(int argc, char *argv[])
             case  9 : args->n_threads = strtol(optarg, 0, 0); break;
             case  8 : args->record_cmd_line = 0; break;
             case 10 : args->no_index = 1; break;
+            case 'W':
+                if (!(args->write_index = write_index_parse(optarg)))
+                    error("Unsupported index format '%s'\n", optarg);
+                break;
+            case 12 : args->force_single = 1; break;
             case 'h':
             case '?': usage(); break;
             default: error("Unknown argument: %s\n", optarg);
         }
     }
     if ( argc==optind && !args->file_list ) usage();
-    if ( argc-optind<2 && !args->file_list ) usage();
-
     if ( args->no_index )
     {
         if ( args->regions_list ) error("Error: cannot combine --no-index with -r/-R\n");
@@ -3319,6 +3663,9 @@ int main_vcfmerge(int argc, char *argv[])
         for (i=0; i<nfiles; i++) free(files[i]);
         free(files);
     }
+    if ( !args->files->nreaders ) usage();
+    if ( args->files->nreaders==1 && !args->force_single ) error("Expected two or more files to merge, got only one. Use --force-single to proceed anyway\n");
+
     merge_vcf(args);
     bcf_sr_destroy(args->files);
     if ( args->regs ) regidx_destroy(args->regs);

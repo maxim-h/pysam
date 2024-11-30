@@ -2,7 +2,7 @@
 
 /*  stats.c -- This is the former bamcheck integrated into samtools/htslib.
 
-    Copyright (C) 2012-2022 Genome Research Ltd.
+    Copyright (C) 2012-2024 Genome Research Ltd.
 
     Author: Petr Danecek <pd3@sanger.ac.uk>
     Author: Sam Nicholls <sam@samnicholls.net>
@@ -768,6 +768,9 @@ static void collect_barcode_stats(bam1_t* bam_line, stats_t* stats) {
             continue;
 
         uint32_t barcode_len = strlen(barcode);
+        if (!barcode_len) {
+            continue;        //consider 0 size barcode same as no barcode - avoids issues with realloc below
+        }
         if (!stats->tags_barcode[tag].nbases) { // tag seen for the first time
             uint32_t offset = 0;
             for (i = 0; i < stats->ntags; i++)
@@ -1558,7 +1561,13 @@ void output_stats(FILE *to, stats_t *stats, int sparse)
     fprintf(to, "SN\tbases duplicated:\t%ld\n", (long)stats->total_len_dup);
     fprintf(to, "SN\tmismatches:\t%ld\t# from NM fields\n", (long)stats->nmismatches);
     fprintf(to, "SN\terror rate:\t%e\t# mismatches / bases mapped (cigar)\n", stats->nbases_mapped_cigar ? (float)stats->nmismatches/stats->nbases_mapped_cigar : 0);
-    float avg_read_length = (stats->nreads_1st+stats->nreads_2nd+stats->nreads_other)?stats->total_len/(stats->nreads_1st+stats->nreads_2nd+stats->nreads_other):0;
+    float avg_read_length = (stats->nreads_1st +
+                             stats->nreads_2nd +
+                             stats->nreads_other)
+        ? (float)stats->total_len / (stats->nreads_1st +
+                                     stats->nreads_2nd +
+                                     stats->nreads_other)
+        : 0;
     fprintf(to, "SN\taverage length:\t%.0f\n", avg_read_length);
     fprintf(to, "SN\taverage first fragment length:\t%.0f\n", stats->nreads_1st? (float)stats->total_len_1st/stats->nreads_1st:0);
     fprintf(to, "SN\taverage last fragment length:\t%.0f\n", stats->nreads_2nd? (float)stats->total_len_2nd/stats->nreads_2nd:0);
@@ -2082,7 +2091,8 @@ static void init_group_id(stats_t *stats, stats_info_t *info, const char *id)
 }
 
 
-static void HTS_NORETURN error(const char *format, ...)
+static void  HTS_FORMAT(HTS_PRINTF_FMT, 1, 2) HTS_NORETURN
+error(const char *format, ...)
 {
     if ( !format )
     {
@@ -2125,7 +2135,7 @@ static void HTS_NORETURN error(const char *format, ...)
 
 void cleanup_stats_info(stats_info_t* info){
     if (info->fai) fai_destroy(info->fai);
-    sam_close(info->sam);
+    if (info->sam) sam_close(info->sam);
     free(info);
 }
 
@@ -2245,7 +2255,7 @@ int init_stat_info_fname(stats_info_t* info, const char* bam_fname, const htsFor
     return 0;
 }
 
-stats_t* stats_init()
+stats_t* stats_init(void)
 {
     stats_t *stats = calloc(1,sizeof(stats_t));
     if (!stats)
@@ -2433,14 +2443,34 @@ int main_stats(int argc, char *argv[])
         {"cov-threshold", required_argument, NULL, 'g'},
         {NULL, 0, NULL, 0}
     };
-    int opt;
+    int opt, tmp_flag;
 
     while ( (opt=getopt_long(argc,argv,"?hdsXxpr:c:l:i:t:m:q:f:F:g:I:S:P:@:",loptions,NULL))>0 )
     {
         switch (opt)
         {
-            case 'f': info->flag_require = bam_str2flag(optarg); break;
-            case 'F': info->flag_filter |= bam_str2flag(optarg); break;
+            case 'f':
+                tmp_flag = bam_str2flag(optarg);
+
+                if (tmp_flag < 0) {
+                    print_error("stats", "Unknown flag '%s'", optarg);
+                    return 1;
+                }
+
+                info->flag_require = tmp_flag;
+                break;
+
+            case 'F':
+                tmp_flag = bam_str2flag(optarg);
+
+                if (tmp_flag < 0) {
+                    print_error("stats", "Unknown flag '%s'", optarg);
+                    return 1;
+                }
+
+                info->flag_filter |= tmp_flag;
+                break;
+
             case 'd': info->flag_filter |= BAM_FDUP; break;
             case 'X': has_index_file = 1; break;
             case 's': break;

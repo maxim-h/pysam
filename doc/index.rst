@@ -1,7 +1,7 @@
 pysam: htslib interface for python
 ==================================
 
-:Author: Andreas Heger, Kevin Jacobs and contributors
+:Author: Andreas Heger, John Marshall, Kevin Jacobs, and contributors
 :Date: |today|
 :Version: |version|
 
@@ -18,13 +18,18 @@ This module provides a low-level wrapper around the htslib_ C-API as
 using cython and a high-level, pythonic API for convenient access to
 the data within genomic file formats. 
 
-The current version wraps *htslib-1.17*, *samtools-1.17*, and *bcftools-1.17*.
+The current version wraps *htslib-1.21*, *samtools-1.21*, and *bcftools-1.21*.
 
 To install the latest release, type::
 
     pip install pysam
 
 See the :ref:`Installation notes <installation>` for details.
+
+This module is unrelated to NREL-PySAM_, which wraps the National Renewable
+Energy Laboratory's System Advisor Model.
+
+.. _NREL-PySAM: https://nrel-pysam.readthedocs.io/
 
 Contents
 --------

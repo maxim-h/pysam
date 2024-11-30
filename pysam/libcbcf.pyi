@@ -20,7 +20,7 @@ if sys.version_info < (3, 8):
 else:
     from typing import Literal
 
-from .libchtslib import HTSFile, _HasFileNo
+from pysam.libchtslib import HTSFile, _HasFileNo
 
 _D = TypeVar("_D")
 _K = TypeVar("_K", str, Union[int, str])
@@ -152,7 +152,7 @@ class VariantHeader:
         stop: int = ...,
         alleles: Optional[Tuple[str, ...]] = ...,
         id: Optional[str] = ...,
-        qual: Optional[int] = ...,
+        qual: Optional[float] = ...,
         filter: Optional[Any] = ...,
         info: Optional[Mapping[str, _InfoValue]] = ...,
         samples: Optional[Iterable[Optional[Mapping[str, _FormatValue]]]] = ...,
@@ -218,7 +218,7 @@ class VariantRecord:
     start: int
     stop: int
     rlen: int
-    qual: Optional[int]
+    qual: Optional[float]
     id: Optional[str]
     ref: Optional[str]
     alleles: Optional[Tuple[str, ...]]
@@ -241,8 +241,8 @@ class VariantRecordSample(_Mapping[str, _FormatValue]):
     def index(self) -> int: ...
     @property
     def name(self) -> str: ...
-    allele_indices: Optional[Tuple[Optional[int, ...]]]
-    alleles: Optional[Tuple[Optional[str, ...]]]
+    allele_indices: Optional[Tuple[Optional[int], ...]]
+    alleles: Optional[Tuple[Optional[str], ...]]
     phased: bool
     def __setitem__(self, key: str, value: _FormatValue) -> None: ...
     def __delitem__(self, key: str) -> None: ...

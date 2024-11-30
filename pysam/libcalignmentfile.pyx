@@ -73,7 +73,8 @@ from cpython cimport array as c_array
 from pysam.libcutils cimport force_bytes, force_str, charptr_to_str
 from pysam.libcutils cimport encode_filename, from_string_and_size
 from pysam.libcalignedsegment cimport makeAlignedSegment, makePileupColumn
-from pysam.libchtslib cimport HTSFile, hisremote
+from pysam.libchtslib cimport HTSFile, hisremote, sam_index_load2, sam_index_load3, \
+                              HTS_IDX_SAVE_REMOTE, HTS_IDX_SILENT_FAIL
 
 from io import StringIO
 
@@ -110,27 +111,30 @@ VALID_HEADER_TYPES = {"HD" : Mapping,
 VALID_HEADERS = ("HD", "SQ", "RG", "PG", "CO")
 
 # default type conversions within SAM header records
-KNOWN_HEADER_FIELDS = {"HD" : {"VN" : str, "SO" : str, "GO" : str},
+KNOWN_HEADER_FIELDS = {"HD" : {"VN" : str, "SO" : str, "GO" : str,
+                               "SS" : str,},
                        "SQ" : {"SN" : str, "LN" : int, "AS" : str,
                                "M5" : str, "SP" : str, "UR" : str,
-                               "AH" : str,},
+                               "AH" : str, "TP" : str, "DS" : str,
+                               "AN" : str,},
                        "RG" : {"ID" : str, "CN" : str, "DS" : str,
                                "DT" : str, "FO" : str, "KS" : str,
                                "LB" : str, "PG" : str, "PI" : str,
                                "PL" : str, "PM" : str, "PU" : str,
-                               "SM" : str,},
+                               "SM" : str, "BC" : str,},
                        "PG" : {"ID" : str, "PN" : str, "CL" : str,
                                "PP" : str, "DS" : str, "VN" : str,},}
 
 # output order of fields within records. Ensure that CL is at
 # the end as parsing a CL will ignore any subsequent records.
-VALID_HEADER_ORDER = {"HD" : ("VN", "SO", "GO"),
+VALID_HEADER_ORDER = {"HD" : ("VN", "SO", "SS", "GO"),
                       "SQ" : ("SN", "LN", "AS", "M5",
-                               "UR", "SP", "AH"),
+                              "UR", "SP", "AH", "TP",
+                              "DS", "AN"),
                       "RG" : ("ID", "CN", "SM", "LB",
                               "PU", "PI", "DT", "DS",
                               "PL", "FO", "KS", "PG",
-                              "PM"),
+                              "PM", "BC"),
                       "PG" : ("PN", "ID", "VN", "PP",
                               "DS", "CL"),}
 
@@ -1005,7 +1009,8 @@ cdef class AlignmentFile(HTSFile):
 
                 if cfilename or cindexname:
                     with nogil:
-                        self.index = sam_index_load2(self.htsfile, cfilename, cindexname)
+                        self.index = sam_index_load3(self.htsfile, cfilename, cindexname,
+                                                     HTS_IDX_SAVE_REMOTE|HTS_IDX_SILENT_FAIL)
 
                     if not self.index and (cindexname or require_index):
                         if errno:
@@ -2142,8 +2147,7 @@ cdef class IteratorRowRegion(IteratorRow):
         if not samfile.has_index():
             raise ValueError("no index available for iteration")
 
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
         with nogil:
             self.iter = sam_itr_queryi(
                 self.index,
@@ -2199,9 +2203,7 @@ cdef class IteratorRowHead(IteratorRow):
                  AlignmentFile samfile,
                  int n,
                  int multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         self.max_rows = n
         self.current_row = 0
@@ -2249,11 +2251,8 @@ cdef class IteratorRowAll(IteratorRow):
 
     """
 
-    def __init__(self, AlignmentFile samfile,
-                 int multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+    def __init__(self, AlignmentFile samfile, int multiple_iterators=False):
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
     def __iter__(self):
         return self
@@ -2292,11 +2291,8 @@ cdef class IteratorRowAllRefs(IteratorRow):
 
     """
 
-    def __init__(self, AlignmentFile samfile,
-                 multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+    def __init__(self, AlignmentFile samfile, multiple_iterators=False):
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         if not samfile.has_index():
             raise ValueError("no index available for fetch")
@@ -2357,8 +2353,7 @@ cdef class IteratorRowSelection(IteratorRow):
     """
 
     def __init__(self, AlignmentFile samfile, positions, int multiple_iterators=True):
-
-        IteratorRow.__init__(self, samfile, multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         self.positions = positions
         self.current_pos = 0

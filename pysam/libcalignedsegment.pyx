@@ -382,7 +382,7 @@ cdef inline pack_tags(tags):
                     raise ValueError("unsupported type code '{}'".format(value.typecode))
 
             if typecode not in DATATYPE2FORMAT:
-                raise ValueError("invalid value type '{}' ({})".format(chr(typecode), array.typecode))
+                raise ValueError("invalid value type '{}'".format(chr(typecode)))
 
             # use array.tostring() to retrieve byte representation and
             # save as bytes
@@ -407,8 +407,10 @@ cdef inline pack_tags(tags):
 
             if typecode == b'Z' or typecode == b'H':
                 datafmt = "2sB%is" % (len(value)+1)
-            else:
+            elif typecode in DATATYPE2FORMAT:
                 datafmt = "2sB%s" % DATATYPE2FORMAT[typecode][0]
+            else:
+                raise ValueError("invalid value type '{}'".format(chr(typecode)))
 
             args.extend([pytag[:2],
                          typecode,
@@ -757,7 +759,19 @@ cdef inline bytes build_alignment_sequence(bam1_t * src):
         elif op == BAM_CHARD_CLIP:
             pass # advances neither
 
-    cdef char * md_tag = <char*>bam_aux2Z(md_tag_ptr)
+    cdef char md_buffer[2]
+    cdef char *md_tag
+    cdef uint8_t md_typecode = md_tag_ptr[0]
+    if md_typecode == b'Z':
+        md_tag = bam_aux2Z(md_tag_ptr)
+    elif md_typecode == b'A':
+        # Work around HTSeq bug that writes 1-character strings as MD:A:v
+        md_buffer[0] = bam_aux2A(md_tag_ptr)
+        md_buffer[1] = b'\0'
+        md_tag = md_buffer
+    else:
+        raise TypeError('Tagged field MD:{}:<value> does not have expected type MD:Z'.format(chr(md_typecode)))
+
     cdef int md_idx = 0
     cdef char c
     s_idx = 0
@@ -965,6 +979,9 @@ cdef class AlignedSegment:
                                    self.query_sequence,
                                    self.query_qualities,
                                    self.tags)))
+
+    def __repr__(self):
+        return f'<{type(self).__name__}({self.query_name!r}, flags={self.flag}={self.flag:#x}, ref={self.reference_name!r}, zpos={self.reference_start}, mapq={self.mapping_quality}, cigar={self.cigarstring!r}, ...)>'
 
     def __copy__(self):
         return makeAlignedSegment(self._delegate, self.header)
@@ -1848,12 +1865,16 @@ cdef class AlignedSegment:
     def get_reference_positions(self, full_length=False):
         """a list of reference positions that this read aligns to.
 
-        By default, this method only returns positions in the
-        reference that are within the alignment. If *full_length* is
-        set, None values will be included for any soft-clipped or
-        unaligned positions within the read. The returned list will
-        thus be of the same length as the read.
+        By default, this method returns the (0-based) positions on the
+        reference that are within the read's alignment, leaving gaps
+        corresponding to deletions and other reference skips.
 
+        When *full_length* is True, the returned list is the same length
+        as the read and additionally includes None values corresponding
+        to insertions or soft-clipping, i.e., to bases of the read that
+        are not aligned to a reference position.
+        (See also :meth:`get_aligned_pairs` which additionally returns
+        the corresponding positions along the read.)
         """
         cdef uint32_t k, i, l, pos
         cdef int op
@@ -1961,6 +1982,10 @@ cdef class AlignedSegment:
     def get_aligned_pairs(self, matches_only=False, with_seq=False):
         """a list of aligned read (query) and reference positions.
 
+        Each item in the returned list is a tuple consisting of
+        the 0-based offset from the start of the read sequence
+        followed by the 0-based reference position.
+
         For inserts, deletions, skipping either query or reference
         position may be None.
 
@@ -1971,7 +1996,7 @@ cdef class AlignedSegment:
         ----------
 
         matches_only : bool
-          If True, only matched bases are returned - no None on either
+          If True, only matched bases are returned --- no None on either
           side.
         with_seq : bool
           If True, return a third element in the tuple containing the
@@ -2144,31 +2169,32 @@ cdef class AlignedSegment:
 
         The output order in the array is "MIDNSHP=X" followed by a
         field for the NM tag. If the NM tag is not present, this
-        field will always be 0.
+        field will always be 0. (Accessing this field via index -1
+        avoids changes if more CIGAR operators are added in future.)
 
-        +-----+--------------+-----+
-        |M    |BAM_CMATCH    |0    |
-        +-----+--------------+-----+
-        |I    |BAM_CINS      |1    |
-        +-----+--------------+-----+
-        |D    |BAM_CDEL      |2    |
-        +-----+--------------+-----+
-        |N    |BAM_CREF_SKIP |3    |
-        +-----+--------------+-----+
-        |S    |BAM_CSOFT_CLIP|4    |
-        +-----+--------------+-----+
-        |H    |BAM_CHARD_CLIP|5    |
-        +-----+--------------+-----+
-        |P    |BAM_CPAD      |6    |
-        +-----+--------------+-----+
-        |=    |BAM_CEQUAL    |7    |
-        +-----+--------------+-----+
-        |X    |BAM_CDIFF     |8    |
-        +-----+--------------+-----+
-        |B    |BAM_CBACK     |9    |
-        +-----+--------------+-----+
-        |NM   |NM tag        |10   |
-        +-----+--------------+-----+
+        +-----+----------------+--------+
+        |M    |pysam.CMATCH    |0       |
+        +-----+----------------+--------+
+        |I    |pysam.CINS      |1       |
+        +-----+----------------+--------+
+        |D    |pysam.CDEL      |2       |
+        +-----+----------------+--------+
+        |N    |pysam.CREF_SKIP |3       |
+        +-----+----------------+--------+
+        |S    |pysam.CSOFT_CLIP|4       |
+        +-----+----------------+--------+
+        |H    |pysam.CHARD_CLIP|5       |
+        +-----+----------------+--------+
+        |P    |pysam.CPAD      |6       |
+        +-----+----------------+--------+
+        |=    |pysam.CEQUAL    |7       |
+        +-----+----------------+--------+
+        |X    |pysam.CDIFF     |8       |
+        +-----+----------------+--------+
+        |B    |pysam.CBACK     |9       |
+        +-----+----------------+--------+
+        |NM   |NM tag          |10 or -1|
+        +-----+----------------+--------+
 
         If no cigar string is present, empty arrays will be returned.
 
@@ -2223,27 +2249,27 @@ cdef class AlignedSegment:
 
         The operations are:
 
-        +-----+--------------+-----+
-        |M    |BAM_CMATCH    |0    |
-        +-----+--------------+-----+
-        |I    |BAM_CINS      |1    |
-        +-----+--------------+-----+
-        |D    |BAM_CDEL      |2    |
-        +-----+--------------+-----+
-        |N    |BAM_CREF_SKIP |3    |
-        +-----+--------------+-----+
-        |S    |BAM_CSOFT_CLIP|4    |
-        +-----+--------------+-----+
-        |H    |BAM_CHARD_CLIP|5    |
-        +-----+--------------+-----+
-        |P    |BAM_CPAD      |6    |
-        +-----+--------------+-----+
-        |=    |BAM_CEQUAL    |7    |
-        +-----+--------------+-----+
-        |X    |BAM_CDIFF     |8    |
-        +-----+--------------+-----+
-        |B    |BAM_CBACK     |9    |
-        +-----+--------------+-----+
+        +-----+----------------+-----+
+        |M    |pysam.CMATCH    |0    |
+        +-----+----------------+-----+
+        |I    |pysam.CINS      |1    |
+        +-----+----------------+-----+
+        |D    |pysam.CDEL      |2    |
+        +-----+----------------+-----+
+        |N    |pysam.CREF_SKIP |3    |
+        +-----+----------------+-----+
+        |S    |pysam.CSOFT_CLIP|4    |
+        +-----+----------------+-----+
+        |H    |pysam.CHARD_CLIP|5    |
+        +-----+----------------+-----+
+        |P    |pysam.CPAD      |6    |
+        +-----+----------------+-----+
+        |=    |pysam.CEQUAL    |7    |
+        +-----+----------------+-----+
+        |X    |pysam.CDIFF     |8    |
+        +-----+----------------+-----+
+        |B    |pysam.CBACK     |9    |
+        +-----+----------------+-----+
 
         .. note::
             The output is a list of (operation, length) tuples, such as

@@ -12,17 +12,19 @@ from codecs import register_error
 from cpython.version cimport PY_MAJOR_VERSION, PY_MINOR_VERSION
 from cpython cimport PyBytes_Check, PyUnicode_Check
 from cpython cimport array as c_array
+from libc.errno cimport errno
 from libc.stdlib cimport calloc, free
 from libc.string cimport strncpy
 from libc.stdint cimport INT32_MAX, int32_t
 from libc.stdio cimport fprintf, stderr, fflush
 from libc.stdio cimport stdout as c_stdout
-from posix.fcntl cimport open as c_open, O_WRONLY
+from posix.fcntl cimport open as c_open, O_WRONLY, O_CREAT, O_TRUNC
+from posix.unistd cimport SEEK_SET, SEEK_CUR, SEEK_END
 
-from libcsamtools cimport samtools_dispatch, samtools_set_stdout, samtools_set_stderr, \
+from pysam.libcsamtools cimport samtools_dispatch, samtools_set_stdout, samtools_set_stderr, \
     samtools_close_stdout, samtools_close_stderr, samtools_set_stdout_fn
 
-from libcbcftools cimport bcftools_dispatch, bcftools_set_stdout, bcftools_set_stderr, \
+from pysam.libcbcftools cimport bcftools_dispatch, bcftools_set_stdout, bcftools_set_stderr, \
     bcftools_close_stdout, bcftools_close_stderr, bcftools_set_stdout_fn
 
 #####################################################################
@@ -261,6 +263,16 @@ cpdef parse_region(contig=None,
     return contig, rstart, rstop
 
 
+cdef int libc_whence_from_io(int whence):
+    # io.SEEK_SET/_CUR/_END are by definition 0/1/2 but C/POSIX's equivalents
+    # have unspecified values. So we must translate, but checking for 0/1/2
+    # rather than io.SEEK_SET/etc suffices.
+    if whence == 0: return SEEK_SET
+    if whence == 1: return SEEK_CUR
+    if whence == 2: return SEEK_END
+    return whence  # Otherwise likely invalid, but let HTSlib or OS report it
+
+
 def _pysam_dispatch(collection,
                     method,
                     args=None,
@@ -310,9 +322,9 @@ def _pysam_dispatch(collection,
     if save_stdout:
         stdout_f = save_stdout
         stdout_h = c_open(force_bytes(stdout_f),
-                          O_WRONLY)
+                          O_WRONLY|O_CREAT|O_TRUNC, 0666)
         if stdout_h == -1:
-            raise IOError("error while opening {} for writing".format(stdout_f))
+            raise OSError(errno, "error while opening file for writing", stdout_f)
 
         samtools_set_stdout_fn(force_bytes(stdout_f))
         bcftools_set_stdout_fn(force_bytes(stdout_f))
@@ -333,7 +345,7 @@ def _pysam_dispatch(collection,
         if collection == "bcftools":
             # in bcftools, most methods accept -o, the exceptions
             # are below:
-            if method not in ("index", "roh", "stats"):
+            if method not in ("head", "index", "roh", "stats"):
                 stdout_option = "-o {}"
         elif method in MAP_STDOUT_OPTIONS[collection]:
             # special case - samtools view -c outputs on stdout

@@ -2,7 +2,7 @@
 
 /*  reheader.c -- reheader subcommand.
 
-    Copyright (C) 2014-2022 Genome Research Ltd.
+    Copyright (C) 2014-2022,2024 Genome Research Ltd.
 
     Author: Petr Danecek <pd3@sanger.ac.uk>
 
@@ -51,8 +51,9 @@ THE SOFTWARE.  */
 typedef struct _args_t
 {
     char **argv, *fname, *samples_fname, *header_fname, *output_fname;
-    char *fai_fname, *rm_tmpfile, *tmp_prefix;
+    char *fai_fname;
     htsFile *fp;
+    faidx_t *fai;
     htsFormat type;
     htsThreadPool *threads;
     int argc, n_threads;
@@ -70,7 +71,8 @@ static char *copy_and_update_contig_line(faidx_t *fai, char *line, void *chr_see
     kstring_t key = {0,0,0}, val = {0,0,0}, tmp = {0,0,0};
     char *chr_name = NULL, *p, *q = line + 9;   // skip ##contig=
     char *end = q;
-    int nopen = 1, chr_len = 0;
+    int nopen = 1;
+    hts_pos_t chr_len = 0;
     while ( *end && *end!='\n' ) end++;
     while ( *q && *q!='\n' && nopen>0 )
     {
@@ -120,7 +122,7 @@ static char *copy_and_update_contig_line(faidx_t *fai, char *line, void *chr_see
         if ( !strcmp("ID",key.s) )
         {
             if ( khash_str2int_has_key(chr_seen,val.s) ) continue;
-            chr_len = faidx_seq_len(fai, val.s);
+            chr_len = faidx_seq_len64(fai, val.s);
             if ( chr_len==-1 )
             {
                 free(val.s); free(key.s); free(tmp.s);
@@ -138,7 +140,7 @@ static char *copy_and_update_contig_line(faidx_t *fai, char *line, void *chr_see
         if ( quoted ) kputc('"',&tmp);
     }
     if ( !chr_name ) return end;
-    ksprintf(dst,"##contig=<ID=%s,length=%d%s>",chr_name,chr_len,tmp.l ? tmp.s : "");
+    ksprintf(dst,"##contig=<ID=%s,length=%"PRIhts_pos"%s>",chr_name,chr_len,tmp.l ? tmp.s : "");
     free(key.s); free(val.s); free(tmp.s);
     return q;
 }
@@ -169,33 +171,13 @@ char *init_tmp_prefix(const char *tmp_prefix)
     kputs("/bcftools.XXXXXX", &prefix);
     return prefix.s;
 }
-static void update_from_fai(args_t *args)
+static void update_from_fai(faidx_t *fai, kstring_t *hdr_txt)
 {
-    if ( !strcmp("-",args->fname) )
-        error("Cannot use the --fai option when reading from standard input.\n");
-
-    faidx_t *fai = fai_load3(args->fai_fname,args->fai_fname,NULL,FAI_FASTA);
-    if ( !fai ) error("Could not parse %s\n", args->fai_fname);
-    args->rm_tmpfile = init_tmp_prefix(args->tmp_prefix);
-    int fd = mkstemp(args->rm_tmpfile);
-    if ( fd<0 ) error("Could not open a temporary file for writing: %s\n", args->rm_tmpfile);
-
-    // get a template header: either from the original VCF or from --header
-    char *ori_hdr_fname = args->header_fname ? args->header_fname : args->fname;
-    htsFile *fp = hts_open(ori_hdr_fname,"r");
-    if ( !fp ) error("Failed to open: %s\n", ori_hdr_fname);
-    bcf_hdr_t *hdr = bcf_hdr_read(fp);
-    if ( !hdr ) error("Failed to read the header: %s\n", ori_hdr_fname);
-    hts_close(fp);  // no need to check the return status here
-
-    // put the header in a text buffer
-    kstring_t hdr_txt_ori = {0,0,0}, hdr_txt_new = {0,0,0};
-    bcf_hdr_format(hdr, 0, &hdr_txt_ori);
-    bcf_hdr_destroy(hdr);
+    kstring_t hdr_txt_new = {0,0,0};
 
     // update the existing contig lines and remove lines not present in the fai file
     void *chr_seen = khash_str2int_init();
-    char *tmp, *beg = hdr_txt_ori.s;
+    char *tmp, *beg = hdr_txt->s;
     while ( beg && *beg )
     {
         tmp = strstr(beg, "\n##contig=<");
@@ -213,17 +195,14 @@ static void update_from_fai(args_t *args)
     for (i=0; i<n; i++)
     {
         if ( khash_str2int_has_key(chr_seen,faidx_iseq(fai,i)) ) continue;
-        ksprintf(&hdr_txt_new,"##contig=<ID=%s,length=%d>\n",faidx_iseq(fai,i),faidx_seq_len(fai,faidx_iseq(fai,i)));
+        ksprintf(&hdr_txt_new,"##contig=<ID=%s,length=%"PRIhts_pos">\n",faidx_iseq(fai,i),faidx_seq_len64(fai,faidx_iseq(fai,i)));
     }
     kputs(tmp+1,&hdr_txt_new);
 
-    if ( write(fd, hdr_txt_new.s, hdr_txt_new.l)!=hdr_txt_new.l ) error("Failed to write %zu bytes to %s\n", hdr_txt_new.l,args->rm_tmpfile);
-    if ( close(fd)!=0 ) error("Failed to close %s\n", args->rm_tmpfile);
-    args->header_fname = args->rm_tmpfile;
+    // Switch the new header content for the old
+    free(hdr_txt->s);
+    memcpy(hdr_txt, &hdr_txt_new, sizeof(*hdr_txt));
 
-    free(hdr_txt_ori.s);
-    free(hdr_txt_new.s);
-    fai_destroy(fai);
     khash_str2int_destroy_free(chr_seen);
 }
 
@@ -421,6 +400,10 @@ static void reheader_vcf_gz(args_t *args)
         free(hdr.s); hdr.s = NULL; hdr.l = hdr.m = 0;
         read_header_file(args->header_fname, &hdr);
     }
+
+    if ( args->fai )
+        update_from_fai(args->fai, &hdr);
+
     if ( samples )
     {
         set_samples(samples, nsamples, &hdr);
@@ -434,7 +417,7 @@ static void reheader_vcf_gz(args_t *args)
     if ( bgzf_write(bgzf_out, hdr.s, hdr.l) < 0 ) error("Can't write BGZF header (code %d)\n", bgzf_out->errcode);
     free(hdr.s);
 
-    // Output all remainig data read with the header block
+    // Output all remaining data read with the header block
     if ( fp->block_length - skip_until > 0 )
     {
         if ( bgzf_write(bgzf_out, buffer+skip_until, fp->block_length-skip_until)<0 ) error("Error: %d\n",fp->errcode);
@@ -480,6 +463,10 @@ static void reheader_vcf(args_t *args)
         free(hdr.s); hdr.s = NULL; hdr.l = hdr.m = 0;
         read_header_file(args->header_fname, &hdr);
     }
+
+    if ( args->fai )
+        update_from_fai(args->fai, &hdr);
+
     if ( samples )
     {
         set_samples(samples, nsamples, &hdr);
@@ -587,6 +574,10 @@ static void reheader_bcf(args_t *args, int is_compressed)
         free(htxt.s); htxt.s = NULL; htxt.l = htxt.m = 0;
         read_header_file(args->header_fname, &htxt);
     }
+
+    if ( args->fai )
+        update_from_fai(args->fai, &htxt);
+
     if ( samples )
     {
         set_samples(samples, nsamples, &htxt);
@@ -676,11 +667,7 @@ static void usage(args_t *args)
     fprintf(bcftools_stderr, "    -h, --header FILE          new header\n");
     fprintf(bcftools_stderr, "    -o, --output FILE          write output to a file [standard output]\n");
     fprintf(bcftools_stderr, "    -s, --samples FILE         new sample names\n");
-#ifdef _WIN32
-    fprintf(bcftools_stderr, "    -T, --temp-prefix PATH     template for temporary file name [/bcftools.XXXXXX]\n");
-#else
-    fprintf(bcftools_stderr, "    -T, --temp-prefix PATH     template for temporary file name [/tmp/bcftools.XXXXXX]\n");
-#endif
+    fprintf(bcftools_stderr, "    -T, --temp-prefix PATH     ignored; was template for temporary file name\n");
     fprintf(bcftools_stderr, "        --threads INT          use multithreading with <int> worker threads (BCF only) [0]\n");
     fprintf(bcftools_stderr, "\n");
     fprintf(bcftools_stderr, "Example:\n");
@@ -701,7 +688,7 @@ int main_reheader(int argc, char *argv[])
     int c;
     args_t *args  = (args_t*) calloc(1,sizeof(args_t));
     args->argc    = argc; args->argv = argv;
-    
+
     static struct option loptions[] =
     {
         {"temp-prefix",1,0,'T'},
@@ -717,7 +704,7 @@ int main_reheader(int argc, char *argv[])
         switch (c)
         {
             case  1 : args->n_threads = strtol(optarg, 0, 0); break;
-            case 'T': args->tmp_prefix = optarg; break;
+            case 'T': break; // unused - was temp file prefix
             case 'f': args->fai_fname = optarg; break;
             case 'o': args->output_fname = optarg; break;
             case 's': args->samples_fname = optarg; break;
@@ -734,8 +721,11 @@ int main_reheader(int argc, char *argv[])
     }
     else args->fname = argv[optind];
 
-    if ( args->fai_fname ) update_from_fai(args);
-    if ( !args->samples_fname && !args->header_fname ) usage(args);
+    if ( args->fai_fname ) {
+        args->fai = fai_load3(args->fai_fname,args->fai_fname,NULL,FAI_FASTA);
+        if ( !args->fai ) error("Could not parse %s\n", args->fai_fname);
+    }
+    if ( !args->samples_fname && !args->header_fname && !args->fai) usage(args);
     if ( !args->fname ) usage(args);
 
     args->fp = hts_open(args->fname,"r");
@@ -756,11 +746,8 @@ int main_reheader(int argc, char *argv[])
     else
         reheader_bcf(args, args->type.compression==bgzf || args->type.compression==gzip);
 
-    if ( args->rm_tmpfile )
-    {
-        unlink(args->rm_tmpfile);
-        free(args->rm_tmpfile);
-    }
+    if (args->fai)
+        fai_destroy(args->fai);
     free(args);
     return 0;
 }

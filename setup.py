@@ -1,27 +1,21 @@
 #! /usr/bin/python
 
-'''pysam - a python module for reading, manipulating and writing
+'''pysam --- a Python package for reading, manipulating, and writing
 genomic data sets.
 
-pysam is a lightweight wrapper of the htslib C-API and provides
-facilities to read and write SAM/BAM/VCF/BCF/BED/GFF/GTF/FASTA/FASTQ
-files as well as access to the command line functionality of the
-samtools and bcftools packages. The module supports compression and
-random access through indexing.
+pysam is a lightweight wrapper of the HTSlib API and provides facilities
+to read and write SAM/BAM/CRAM/VCF/BCF/BED/GFF/GTF/FASTA/FASTQ files
+as well as access to the command-line functionality of samtools and bcftools.
+The module supports compression and random access through indexing.
 
-This module provides a low-level wrapper around the htslib C-API as
-using cython and a high-level API for convenient access to the data
-within standard genomic file formats.
-
-See:
-http://www.htslib.org
-https://github.com/pysam-developers/pysam
-http://pysam.readthedocs.org/en/stable
-
+This module provides a low-level wrapper around HTSlib's C API using Cython
+and a high-level API for convenient access to the data within standard genomic
+file formats.
 '''
 
 import collections
 import glob
+import logging
 import os
 import platform
 import re
@@ -29,21 +23,29 @@ import subprocess
 import sys
 import sysconfig
 from contextlib import contextmanager
-from distutils import log
 from setuptools import setup, Command
-from distutils.command.build import build
 from setuptools.command.sdist import sdist
-from distutils.errors import LinkError
+from setuptools.extension import Extension
 
-from cy_build import CyExtension as Extension, cy_build_ext as build_ext
+try:
+    from setuptools.errors import LinkError
+except ImportError:
+    from distutils.errors import LinkError
+
+try:
+    from Cython.Distutils import build_ext
+except ImportError:
+    from setuptools.command.build_ext import build_ext
+
 try:
     import cython  # noqa
     HAVE_CYTHON = True
 except ImportError:
     HAVE_CYTHON = False
 
-IS_PYTHON3 = sys.version_info.major >= 3
 IS_DARWIN = platform.system() == 'Darwin'
+
+log = logging.getLogger('pysam')
 
 
 @contextmanager
@@ -76,9 +78,7 @@ def run_make(targets):
 
 
 def run_make_print_config():
-    stdout = subprocess.check_output(["make", "-s", "print-config"])
-    if IS_PYTHON3:
-        stdout = stdout.decode("ascii")
+    stdout = subprocess.check_output(["make", "-s", "print-config"], encoding="ascii")
 
     make_print_config = {}
     for line in stdout.splitlines():
@@ -91,9 +91,7 @@ def run_make_print_config():
 
 
 def run_nm_defined_symbols(objfile):
-    stdout = subprocess.check_output(["nm", "-g", "-P", objfile])
-    if IS_PYTHON3:
-        stdout = stdout.decode("ascii")
+    stdout = subprocess.check_output(["nm", "-g", "-P", objfile], encoding="ascii")
 
     symbols = set()
     for line in stdout.splitlines():
@@ -230,22 +228,37 @@ class cythonize_sdist(sdist):
     def run(self):
         from Cython.Build import cythonize
         cythonize(self.distribution.ext_modules)
-        sdist.run(self)
+        super().run()
 
 
-# Override build command to add extra build steps.
-class extra_build(build):
+# Override Cythonised build_ext command to customise macOS shared libraries.
+
+class CyExtension(Extension):
+    def __init__(self, *args, **kwargs):
+        self._init_func = kwargs.pop("init_func", None)
+        self._prebuild_func = kwargs.pop("prebuild_func", None)
+        super().__init__(*args, **kwargs)
+
+    def extend_includes(self, includes):
+        self.include_dirs.extend(includes)
+
+    def extend_macros(self, macros):
+        self.define_macros.extend(macros)
+
+    def extend_extra_objects(self, objs):
+        self.extra_objects.extend(objs)
+
+
+class cy_build_ext(build_ext):
     def check_ext_symbol_conflicts(self):
         """Checks for symbols defined in multiple extension modules,
         which can lead to crashes due to incorrect functions being invoked.
         Avoid by adding an appropriate #define to import/pysam.h or in
         unusual cases adding another rewrite rule to devtools/import.py.
         """
-        build_ext_obj = self.distribution.get_command_obj('build_ext')
-
         symbols = dict()
         for ext in self.distribution.ext_modules:
-            for sym in run_nm_defined_symbols(build_ext_obj.get_ext_fullpath(ext.name)):
+            for sym in run_nm_defined_symbols(self.get_ext_fullpath(ext.name)):
                 symbols.setdefault(sym, []).append(ext.name.lstrip('pysam.'))
 
         errors = 0
@@ -257,14 +270,55 @@ class extra_build(build):
         if errors > 0: raise LinkError("symbols defined in multiple extensions")
 
     def run(self):
-        build.run(self)
+        if sys.platform == 'darwin':
+            ldshared = os.environ.get('LDSHARED', sysconfig.get_config_var('LDSHARED'))
+            os.environ['LDSHARED'] = ldshared.replace('-bundle', '')
+
+        super().run()
         try:
             if HTSLIB_MODE != 'separate':
                 self.check_ext_symbol_conflicts()
         except OSError as e:
-            log.warn("skipping symbol collision check (invoking nm failed: %s)", e)
+            log.warning("skipping symbol collision check (invoking nm failed: %s)", e)
         except subprocess.CalledProcessError:
-            log.warn("skipping symbol collision check (invoking nm failed)")
+            log.warning("skipping symbol collision check (invoking nm failed)")
+
+    def build_extension(self, ext):
+
+        if isinstance(ext, CyExtension) and ext._init_func:
+            ext._init_func(ext)
+
+        if not self.inplace:
+            ext.library_dirs.append(os.path.join(self.build_lib, "pysam"))
+
+        if sys.platform == 'darwin':
+            # The idea is to give shared libraries an install name of the form
+            # `@rpath/<library-name.so>`, and to set the rpath equal to
+            # @loader_path. This will allow Python packages to find the library
+            # in the expected place, while still giving enough flexibility to
+            # external applications to link against the library.
+            relative_module_path = ext.name.replace(".", os.sep) + sysconfig.get_config_var('EXT_SUFFIX')
+            library_path = os.path.join(
+                "@rpath", os.path.basename(relative_module_path)
+            )
+
+            if not ext.extra_link_args:
+                ext.extra_link_args = []
+            ext.extra_link_args += ['-dynamiclib',
+                                    '-rpath', '@loader_path',
+                                    '-Wl,-headerpad_max_install_names',
+                                    '-Wl,-install_name,%s' % library_path,
+                                    '-Wl,-x']
+        else:
+            if not ext.extra_link_args:
+                ext.extra_link_args = []
+
+            ext.extra_link_args += ['-Wl,-rpath,$ORIGIN']
+
+        if isinstance(ext, CyExtension) and ext._prebuild_func:
+            ext._prebuild_func(ext, self.force)
+
+        super().build_extension(ext)
 
 
 class clean_ext(Command):
@@ -432,7 +486,7 @@ with open(os.path.join("pysam", "config.py"), "w") as outf:
             for line in inf:
                 if line.startswith("#define"):
                     key, value = re.match(
-                        "#define (\S+)\s+(\S+)", line).groups()
+                        r"#define (\S+)\s+(\S+)", line).groups()
                     config_values[key] = value
             for key in ["ENABLE_GCS",
                         "ENABLE_PLUGINS",
@@ -478,7 +532,7 @@ else:
 
 define_macros = []
 
-suffix = sysconfig.get_config_var('EXT_SUFFIX') or sysconfig.get_config_var('SO')
+suffix = sysconfig.get_config_var('EXT_SUFFIX')
 
 internal_htslib_libraries = [
     os.path.splitext("chtslib{}".format(suffix))[0]]
@@ -515,7 +569,7 @@ def prebuild_libchtslib(ext, force):
             args = " ".join(ext.extra_compile_args)
             run_make(["ALL_CPPFLAGS=-I. " + args + " $(CPPFLAGS)", "lib-static"])
     else:
-        log.warn("skipping 'libhts.a' (already built)")
+        log.warning("skipping 'libhts.a' (already built)")
 
 
 def prebuild_libcsamtools(ext, force):
@@ -609,8 +663,9 @@ Operating System :: MacOS
 metadata = {
     'name': "pysam",
     'version': get_pysam_version(),
-    'description': "pysam",
+    'description': "Package for reading, manipulating, and writing genomic data",
     'long_description': __doc__,
+    'long_description_content_type': "text/x-rst",
     'author': "Andreas Heger",
     'author_email': "andreas.heger@gmail.com",
     'license': "MIT",
@@ -618,9 +673,8 @@ metadata = {
     'classifiers': [_f for _f in classifiers.split("\n") if _f],
     'url': "https://github.com/pysam-developers/pysam",
     'packages': package_list,
-    'requires': ['cython (>=0.29.12)'],
-    'ext_modules': [Extension(**opts) for opts in modules],
-    'cmdclass': {'build': extra_build, 'build_ext': build_ext, 'clean_ext': clean_ext, 'sdist': cythonize_sdist},
+    'ext_modules': [CyExtension(**opts) for opts in modules],
+    'cmdclass': {'build_ext': cy_build_ext, 'clean_ext': clean_ext, 'sdist': cythonize_sdist},
     'package_dir': package_dirs,
     'package_data': {'': ['*.pxd', '*.h', 'py.typed', '*.pyi'], },
     # do not pack in order to permit linking to csamtools.so

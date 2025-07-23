@@ -73,7 +73,8 @@ from cpython cimport array as c_array
 from pysam.libcutils cimport force_bytes, force_str, charptr_to_str
 from pysam.libcutils cimport encode_filename, from_string_and_size
 from pysam.libcalignedsegment cimport makeAlignedSegment, makePileupColumn
-from pysam.libchtslib cimport HTSFile, hisremote
+from pysam.libchtslib cimport HTSFile, hisremote, sam_index_load2, sam_index_load3, \
+                              HTS_IDX_SAVE_REMOTE, HTS_IDX_SILENT_FAIL
 
 from io import StringIO
 
@@ -110,27 +111,30 @@ VALID_HEADER_TYPES = {"HD" : Mapping,
 VALID_HEADERS = ("HD", "SQ", "RG", "PG", "CO")
 
 # default type conversions within SAM header records
-KNOWN_HEADER_FIELDS = {"HD" : {"VN" : str, "SO" : str, "GO" : str},
+KNOWN_HEADER_FIELDS = {"HD" : {"VN" : str, "SO" : str, "GO" : str,
+                               "SS" : str,},
                        "SQ" : {"SN" : str, "LN" : int, "AS" : str,
                                "M5" : str, "SP" : str, "UR" : str,
-                               "AH" : str,},
+                               "AH" : str, "TP" : str, "DS" : str,
+                               "AN" : str,},
                        "RG" : {"ID" : str, "CN" : str, "DS" : str,
                                "DT" : str, "FO" : str, "KS" : str,
                                "LB" : str, "PG" : str, "PI" : str,
                                "PL" : str, "PM" : str, "PU" : str,
-                               "SM" : str,},
+                               "SM" : str, "BC" : str,},
                        "PG" : {"ID" : str, "PN" : str, "CL" : str,
                                "PP" : str, "DS" : str, "VN" : str,},}
 
 # output order of fields within records. Ensure that CL is at
 # the end as parsing a CL will ignore any subsequent records.
-VALID_HEADER_ORDER = {"HD" : ("VN", "SO", "GO"),
+VALID_HEADER_ORDER = {"HD" : ("VN", "SO", "SS", "GO"),
                       "SQ" : ("SN", "LN", "AS", "M5",
-                               "UR", "SP", "AH"),
+                              "UR", "SP", "AH", "TP",
+                              "DS", "AN"),
                       "RG" : ("ID", "CN", "SM", "LB",
                               "PU", "PI", "DT", "DS",
                               "PL", "FO", "KS", "PG",
-                              "PM"),
+                              "PM", "BC"),
                       "PG" : ("PN", "ID", "VN", "PP",
                               "DS", "CL"),}
 
@@ -1005,7 +1009,8 @@ cdef class AlignmentFile(HTSFile):
 
                 if cfilename or cindexname:
                     with nogil:
-                        self.index = sam_index_load2(self.htsfile, cfilename, cindexname)
+                        self.index = sam_index_load3(self.htsfile, cfilename, cindexname,
+                                                     HTS_IDX_SAVE_REMOTE|HTS_IDX_SILENT_FAIL)
 
                     if not self.index and (cindexname or require_index):
                         if errno:
@@ -1659,7 +1664,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, splice_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}):
+    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_partner = False):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1673,24 +1678,33 @@ cdef class AlignmentFile(HTSFile):
             AlignedSegment r
             int BAM_CREF_SKIP = 3 #BAM_CREF_SKIP
             bint not_start
-            bint cref_skip_minus_strand_previous
+            bint no_match_donor_site
+            bint no_match_acceptor_site
 
         res = collections.defaultdict(set)
 
         un = 0
 
         match_or_deletion = {0, 2, 7, 8} # only M/=/X (0/7/8) and D (2) are related to genome position
+
+        no_match_donor_site = (etype == "A3SS") and no_match_splice_partner
+        no_match_acceptor_site = (etype == "A5SS") and no_match_splice_partner
+        if no_match_donor_site and no_match_acceptor_site:
+            raise AssertionError("Can't ignore both donor and acceptor spice sites")
+
         for r in read_iterator:
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
+
             # Filter out reads if
-            if (cigar is None or # no CIGAR
-                not r.has_tag(sam_options['CB']) or # No cell barcode
-                ((sam_options['UMI'] is not None) and # UMI tag expected, but not found
-                    (not r.has_tag(sam_options['UMI']))) or
-                r.is_secondary or # Secondary alignment
-                (forward_strand == r.is_reverse)): # Wrong strand. TODO: only works with  default reverse strandedness of 10x.
+            if (cigar is None # no CIGAR
+                    or not r.has_tag(sam_options['CB']) # No cell barcode
+                    or ((sam_options['UMI'] is not None) # UMI tag expected, but not found
+                        and (not r.has_tag(sam_options['UMI'])))
+                    or r.is_secondary # Secondary alignment
+                    #TODO: only works with  default reverse strandedness of 10x.
+                    or (forward_strand == r.is_reverse)): # Wrong strand.
                 continue
 
             if sam_options['UMI'] is None:
@@ -1699,39 +1713,27 @@ cdef class AlignmentFile(HTSFile):
             else:
                 umi = r.get_tag(sam_options['UMI'])
 
-            #handle different strand orientation. only for positively stranded case
-            if not forward_strand:
-                cigar = list(map(lambda st: (st[0], -st[1]), reversed(cigar)))
-                base_position += r.infer_query_length()
-
-            cref_skip_minus_strand_previous = False
-
             for op, nt in cigar:
                 if op in match_or_deletion:
                     base_position += nt
-                    not_start = True
-                    # this will happen if we go in reverse
-                    if base_position == splice_site:
-                        # this check is for when a 5' splice site is present
-                        # at the exact position where a 3' splice site shoule be
-                        if not forward_strand:
-                            # Will add the UMI, but only if on the next iteration
-                            # we see BAM_CREF_SKIP
-                            cref_skip_minus_strand_previous = True
-                elif op == BAM_CREF_SKIP and not_start:
-                    if cref_skip_minus_strand_previous:
-                        res[r.get_tag(sam_options['CB'])].add(umi)
-                        cref_skip_minus_strand_previous = False
-                        continue
-                    #junc_start = base_position
+                elif op == BAM_CREF_SKIP:
+                    junc_start = base_position
                     base_position += nt
-                    # this will happen if we go forward
-                    if base_position == splice_site:
-                        if not forward_strand:
-                            cref_skip_minus_strand_previous = False
-                            continue
-                        res[r.get_tag(sam_options['CB'])].add(umi)
-                    cref_skip_minus_strand_previous = False
+                    junc_end = base_position
+
+                    if forward_strand:
+                        if ((no_match_acceptor_site
+                                or junc_end == acceptor_site)
+                            and (no_match_donor_site
+                                or junc_start == donor_site)):
+                            res[r.get_tag(sam_options['CB'])].add(umi)
+                    else:
+                        if ((no_match_acceptor_site
+                                or junc_start == acceptor_site)
+                            and (no_match_donor_site
+                                 or junc_end == donor_site)):
+                            res[r.get_tag(sam_options['CB'])].add(umi)
+
         return res
 
 
@@ -2147,8 +2149,7 @@ cdef class IteratorRowRegion(IteratorRow):
         if not samfile.has_index():
             raise ValueError("no index available for iteration")
 
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
         with nogil:
             self.iter = sam_itr_queryi(
                 self.index,
@@ -2204,9 +2205,7 @@ cdef class IteratorRowHead(IteratorRow):
                  AlignmentFile samfile,
                  int n,
                  int multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         self.max_rows = n
         self.current_row = 0
@@ -2254,11 +2253,8 @@ cdef class IteratorRowAll(IteratorRow):
 
     """
 
-    def __init__(self, AlignmentFile samfile,
-                 int multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+    def __init__(self, AlignmentFile samfile, int multiple_iterators=False):
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
     def __iter__(self):
         return self
@@ -2297,11 +2293,8 @@ cdef class IteratorRowAllRefs(IteratorRow):
 
     """
 
-    def __init__(self, AlignmentFile samfile,
-                 multiple_iterators=False):
-
-        IteratorRow.__init__(self, samfile,
-                             multiple_iterators=multiple_iterators)
+    def __init__(self, AlignmentFile samfile, multiple_iterators=False):
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         if not samfile.has_index():
             raise ValueError("no index available for fetch")
@@ -2362,8 +2355,7 @@ cdef class IteratorRowSelection(IteratorRow):
     """
 
     def __init__(self, AlignmentFile samfile, positions, int multiple_iterators=True):
-
-        IteratorRow.__init__(self, samfile, multiple_iterators=multiple_iterators)
+        super().__init__(samfile, multiple_iterators=multiple_iterators)
 
         self.positions = positions
         self.current_pos = 0

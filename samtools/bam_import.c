@@ -4,7 +4,7 @@
  *   samtools import a_1.fq a_2.fq
  *   samtools import a_interleaved.fq
  *
- * Copyright (C) 2020-2021 Genome Research Ltd.
+ * Copyright (C) 2020-2021, 2023-2024 Genome Research Ltd.
  *
  * Author: James Bonfield <jkb@sanger.ac.uk>
  */
@@ -63,6 +63,7 @@ static int usage(FILE *fp, int exit_status) {
     fprintf(fp, "  -u           Uncompressed output\n");
     fprintf(fp, "  --order TAG  Store Nth record count in TAG\n");
     fprintf(fp, "\n");
+    fprintf(fp, "      --no-PG  Do not add a PG line\n");
     sam_global_opt_help(fp, "-.O.-@--");
 
     fprintf(fp, "\nA single fastq file will be interpreted as -s, -0 or -1 depending on\n");
@@ -93,6 +94,7 @@ typedef struct {
     char *rg;
     char *rg_line;
     char *order;
+    int order_str;
     int compress_level;
     htsThreadPool p;
     int name2;
@@ -158,7 +160,7 @@ static int import_fastq(int argc, char **argv, opts_t *opts) {
     if (argc == 1)
         opts->fn[FQ_SINGLE] = argv[0];
     else
-        for (i = 0; i < 4; i++)
+        for (i = 0; i < 2; i++)
             if (argc > i)
                 opts->fn[FQ_R1+i] = argv[i];
 
@@ -258,6 +260,25 @@ static int import_fastq(int argc, char **argv, opts_t *opts) {
         goto err;
     }
 
+    if (!opts->no_pg) {
+        char *arg_list;
+        if (!(arg_list = stringify_argv(argc+1+optind, argv-1-optind))) {
+            print_error("view", "failed to create arg_list");
+            goto err;
+        }
+        if (sam_hdr_add_pg(hdr_out, "samtools",
+                           "VN", samtools_version(),
+                           arg_list ? "CL" : NULL,
+                           arg_list ? arg_list : NULL,
+                           NULL)) {
+            fprintf(stderr, "Failed to add PG line to the header");
+            free(arg_list);
+            goto err;
+        }
+
+        free(arg_list);
+    }
+
     // Read group
     if (opts->rg_line) {
         if (*opts->rg_line != '@')
@@ -289,7 +310,7 @@ static int import_fastq(int argc, char **argv, opts_t *opts) {
 
 
     // Interleave / combine from n files (ids[0..n-1]).
-    int res;
+    int res = 0;
     int eof = 0;
     do {
         idx_seq.l = idx_qual.l = 0;
@@ -358,9 +379,23 @@ static int import_fastq(int argc, char **argv, opts_t *opts) {
             }
 
             if (opts->order) {
-                if (bam_aux_update_int(b, opts->order, read_num++) < 0) {
-                    ret = -1;
-                    goto err;
+                if (opts->order_str) {
+                    char buf[25];
+                    snprintf(buf, sizeof(buf), "%0*"PRIu64,
+                             opts->order_str, read_num++);
+                    if (bam_aux_update_str(b, opts->order,
+                                           strlen(buf), buf) < 0) {
+                        ret = -1;
+                        goto err;
+                    }
+                } else {
+                    if (bam_aux_update_int(b, opts->order, read_num++) < 0) {
+                        ret = -1;
+                        goto err;
+                    }
+                    if (read_num == UINT_MAX)
+                        fprintf(stderr, "Warning: --order tag has overflowed."
+                                "  Consider using TAG:LENGTH instead\n");
                 }
             }
 
@@ -421,6 +456,7 @@ int main_import(int argc, char *argv[]) {
         .rg = NULL,
         .rg_line = NULL,
         .order = NULL,
+        .order_str = 0,
         .compress_level = -1,
         .name2 = 0,
     };
@@ -470,7 +506,11 @@ int main_import(int argc, char *argv[]) {
         case 'N': opts.name2 = 1; break;
 
         case 9: opts.no_pg = 1; break;
-        case 3: opts.order = optarg; break;
+        case 3:
+            opts.order = optarg;
+            if (strlen(optarg) > 3 && optarg[2] == ':')
+                opts.order_str = atoi(optarg+3);
+            break;
 
         case 'h': return usage(stdout, EXIT_SUCCESS);
         case '?': return usage(stderr, EXIT_FAILURE);

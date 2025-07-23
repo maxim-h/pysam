@@ -3,7 +3,6 @@ import pysam
 import unittest
 import json
 import collections
-import string
 import struct
 import copy
 import array
@@ -14,14 +13,7 @@ from TestUtils import (
     BAM_DATADIR,
     get_temp_filename,
     get_temp_context,
-    IS_PYTHON3,
 )
-
-
-if IS_PYTHON3:
-    maketrans = str.maketrans
-else:
-    maketrans = string.maketrans
 
 
 def setUpModule():
@@ -776,6 +768,32 @@ class TestAlignedSegment(ReadTest):
             ],
         )
 
+    def test_get_aligned_pairs_1character_md(self):
+        a = self.build_read()
+        a.query_sequence = "A" * 7
+        a.cigarstring = "7M"
+        a.set_tag("MD", "7", value_type="A")
+        self.assertEqual(
+            a.get_aligned_pairs(with_seq=True),
+            [
+                (0, 20, "A"),
+                (1, 21, "A"),
+                (2, 22, "A"),
+                (3, 23, "A"),
+                (4, 24, "A"),
+                (5, 25, "A"),
+                (6, 26, "A"),
+            ],
+        )
+
+    def test_get_aligned_pairs_bad_type_md(self):
+        a = self.build_read()
+        a.query_sequence = "A" * 7
+        a.cigarstring = "7M"
+        a.set_tag("MD", 7)
+        with self.assertRaises(TypeError):
+            a.get_aligned_pairs(with_seq=True)
+
     def testNoSequence(self):
         """issue 176: retrieving length without query sequence
         with soft-clipping.
@@ -1051,7 +1069,7 @@ class TestBaseModifications(unittest.TestCase):
         expect = {
             ("C", 0, "m"): [(6, 102), (17, 128), (20, 153), (31, 179), (34, 204)],
             ("N", 0, "n"): [(15, 212)],
-            ("C", 0, 76792): [(19, 161), (34, 187)],
+            ("C", 0, 76792): [(19, 161), (34, 33)],
         }
 
         with pysam.AlignmentFile(filename, check_sq=False) as inf:
@@ -1071,6 +1089,21 @@ class TestBaseModifications(unittest.TestCase):
         with pysam.AlignmentFile(filename, check_sq=False) as inf:
             r = next(iter(inf))
             self.assertDictEqual(r.modified_bases, expect)
+
+    def testExplicit(self):
+        """reference bases should always be the same nucleotide
+        """
+        filename = os.path.join(BAM_DATADIR, "MM-explicit.bam")
+        expected_output = [
+            {("C", 0, "m"): [(9, 200), (10, 50), (14, 160)], ("C", 0, "h"): [(9, 10), (10, 170), (14, 20)]},
+            {("C", 0, "m"): [(9, 200), (10, 50), (13, 10), (14, 160), (16, 10)],
+             ("C", 0, "h"): [(9, 10), (10, 170), (13, 5), (14, 20), (16, 5)]},
+            {("C", 0, "m"): [(9, 200), (14, 160)], ("C", 0, "h"): [(9, 10), (10, 170), (13, 5), (14, 20), (16, 5)]},
+        ]
+
+        with pysam.AlignmentFile(filename, check_sq=False) as inf:
+            for r, expected in zip(inf, expected_output):
+                self.assertDictEqual(r.modified_bases, expected)
 
     def testMulti(self):
         """reference bases should always be the same nucleotide
@@ -1135,7 +1168,7 @@ class TestBaseModifications(unittest.TestCase):
                 self.assertDictEqual(r.modified_bases, expect[r.query_name][0])
                 self.assertDictEqual(r.modified_bases_forward, expect[r.query_name][1])
                 for (B, s, _), mods in r.modified_bases.items():
-                    C = B.translate(maketrans("ACGTacgtNnXx", "TGCAtgcaNnXx"))
+                    C = B.translate(str.maketrans("ACGTacgtNnXx", "TGCAtgcaNnXx"))
                     for pos, _ in mods:
                         if r.is_reverse:
                             if s == 1:
@@ -1591,6 +1624,18 @@ class TestSetTagGetTag(ReadTest):
             alt_value_type="I",
         )
 
+    def test_set_tag_invalid_value_type(self):
+        with self.assertRaises(ValueError):
+            self.check_tag("TT", "abc", value_type="#")
+
+    def test_set_array_tag_invalid_value_type(self):
+        with self.assertRaises(ValueError):
+            self.check_tag("TT", array.array('I', range(4)), value_type='#')
+
+    def test_set_array_tag_invalid_typecode(self):
+        with self.assertRaises(ValueError):
+            self.check_tag("TT", array.array('L', range(4)), value_type=None)
+
 
 class TestSetTagsGetTag(TestSetTagGetTag):
     def check_tag(self, tag, value, value_type, alt_value_type=None):
@@ -1688,7 +1733,7 @@ class TestForwardStrandValues(ReadTest):
         a.is_reverse = False
         fwd_seq = a.query_sequence
 
-        rev_seq = fwd_seq.translate(maketrans("ACGTacgtNnXx", "TGCAtgcaNnXx"))[::-1]
+        rev_seq = fwd_seq.translate(str.maketrans("ACGTacgtNnXx", "TGCAtgcaNnXx"))[::-1]
         self.assertEqual(fwd_seq, a.get_forward_sequence())
         a.is_reverse = True
         self.assertEqual(fwd_seq, a.query_sequence)

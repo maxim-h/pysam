@@ -25,10 +25,10 @@ as it resolves non-python dependencies and uses pre-configured
 compilation options. Especially for OS X this will potentially save a
 lot of trouble.
 
-The current version of pysam wraps 3rd-party code from htslib-1.17, samtools-1.17, and bcftools-1.17.
+The current version of pysam wraps 3rd-party code from htslib-1.21, samtools-1.21, and bcftools-1.21.
 
-Pysam is available through `pypi
-<https://pypi.python.org/pypi/pysam>`_. To install, type::
+Pysam is available through `PyPI <https://pypi.org/project/pysam/>`_.
+To install, type::
 
    pip install pysam
 
@@ -42,10 +42,10 @@ Questions and comments are very welcome and should be sent to the
 .. _tabix: http://samtools.sourceforge.net/tabix.shtml
 .. _Li 2009: http://www.ncbi.nlm.nih.gov/pubmed/19505943
 
-.. |build-status| image:: https://travis-ci.org/pysam-developers/pysam.svg
+.. |build-status| image:: https://github.com/pysam-developers/pysam/actions/workflows/ci.yaml/badge.svg
     :alt: build status
     :scale: 100%
-    :target: https://travis-ci.org/pysam-developers/pysam
+    :target: https://github.com/pysam-developers/pysam/actions/workflows/ci.yaml
 
 .. |docs| image:: https://readthedocs.org/projects/pysam/badge/?version=latest
     :alt: Documentation Status

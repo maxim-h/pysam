@@ -3,7 +3,7 @@
 /*  bam_consensus.c -- consensus subcommand.
 
     Copyright (C) 1998-2001,2003 Medical Research Council (Gap4/5 source)
-    Copyright (C) 2003-2005,2007-2023 Genome Research Ltd.
+    Copyright (C) 2003-2005,2007-2024 Genome Research Ltd.
 
     Author: James Bonfield <jkb@sanger.ac.uk>
 
@@ -1919,8 +1919,8 @@ static int calculate_consensus_simple(const pileup_t *plp,
     // Ignore ambiguous bases in seq for now, so we don't treat R, Y, etc
     // as part of one base and part another.  Based on BAM seqi values.
     // We also use freq[16] as "*" for gap.
-    int freq[17] = {0};  // base frequency, aka depth
-    int score[17] = {0}; // summation of base qualities
+    int      freq[17]  = {0}; // base frequency, aka depth
+    uint64_t score[17] = {0}; // summation of base qualities
 
     // Accumulate
     for (; plp; plp = plp->next) {
@@ -1961,13 +1961,13 @@ static int calculate_consensus_simple(const pileup_t *plp,
     }
 
     // Total usable depth
-    int tscore = 0;
+    uint64_t tscore = 0;
     for (i = 0; i < 5; i++)
         tscore += score[1<<i];
 
     // Best and second best potential calls
-    int call1  = 15, call2 = 15;
-    int score1 = 0,  score2 = 0;
+    int      call1  = 15, call2  = 15;
+    uint64_t score1 = 0,  score2 = 0;
     for (i = 0; i < 5; i++) {
         int c = 1<<i; // A C G T *
         if (score1 < score[c]) {
@@ -1982,8 +1982,8 @@ static int calculate_consensus_simple(const pileup_t *plp,
     }
 
     // Work out which best and second best are usable as a call
-    int used_score = score1;
-    int used_base  = call1;
+    uint64_t used_score = score1;
+    int      used_base  = call1;
     if (score2 >= opts->het_fract * score1 && opts->ambig) {
         used_base  |= call2;
         used_score += score2;
@@ -2045,20 +2045,30 @@ static int basic_pileup(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
     }
 
     if (opts->all_bases) {
-        if (tid != opts->last_tid && opts->last_tid >= 0) {
-            hts_pos_t len = sam_hdr_tid2len(opts->h, opts->last_tid);
-            if (opts->iter)
-                len =  MIN(opts->iter->end, len);
-            if (empty_pileup2(opts, opts->h, opts->last_tid, opts->last_pos,
-                              len) < 0)
-                return -1;
-            if (tid >= 0) {
-                if (empty_pileup2(opts, opts->h, tid,
-                                  opts->iter ? opts->iter->beg : 0,
-                                  pos-1) < 0)
+        if (tid != opts->last_tid && opts->last_tid >= -1) {
+            if (opts->last_tid >= 0) {
+                // remainder of previous ref
+                hts_pos_t len = sam_hdr_tid2len(opts->h, opts->last_tid);
+                if (opts->iter)
+                    len =  MIN(opts->iter->end, len);
+                if (empty_pileup2(opts, opts->h, opts->last_tid,
+                                  opts->last_pos, len) < 0)
+                    return -1;
+            }
+
+            opts->last_pos = opts->iter ? opts->iter->beg : 0;
+        }
+
+        // Any refs between last_tid and tid
+        if (!opts->iter && tid > opts->last_tid && opts->all_bases > 1) {
+            while (++opts->last_tid < tid) {
+                hts_pos_t len = sam_hdr_tid2len(opts->h, opts->last_tid);
+                if (empty_pileup2(opts, opts->h, opts->last_tid, 0, len) < 0)
                     return -1;
             }
         }
+
+        // Any gaps in this ref (same tid) or at start of this new tid
         if (opts->last_pos >= 0 && pos > opts->last_pos+1) {
             if (empty_pileup2(opts, opts->h, p->b.core.tid, opts->last_pos,
                               pos-1) < 0)
@@ -2075,7 +2085,10 @@ static int basic_pileup(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
         calculate_consensus_gap5m(pos, opts->use_mqual ? CONS_MQUAL : 0,
                                   depth, p, opts, &cons, opts->default_qual,
                                   &cons_prob_recall, &cons_prob_precise);
-        if (cons.het_logodd > 0 && opts->ambig) {
+        if (cons.depth < opts->min_depth) {
+            cb = 'N';
+            cq = 0;
+        } else if (cons.het_logodd > 0 && opts->ambig) {
             cb = "AMRWa" // 5x5 matrix with ACGT* per row / col
                  "MCSYc"
                  "RSGKg"
@@ -2169,9 +2182,11 @@ static int basic_fasta(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
             return 0;
     }
 
+ next_ref:
     if (tid != opts->last_tid) {
         if (opts->last_tid != -1) {
             if (opts->all_bases) {
+                // Fill in remainder of previous reference
                 int i, N;
                 if (opts->iter) {
                     opts->last_pos = MAX(opts->last_pos, opts->iter->beg-1);
@@ -2199,9 +2214,13 @@ static int basic_fasta(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
         }
 
         seq->l = 0; qual->l = 0;
+
+        if (!opts->iter && opts->all_bases > 1 && ++opts->last_tid < tid) {
+            opts->last_pos = 0;
+            goto next_ref;
+        }
+
         opts->last_tid = tid;
-//        if (opts->all_bases)
-//            opts->last_pos = 0;
         if (opts->iter)
             opts->last_pos = opts->iter->beg;
         else
@@ -2214,14 +2233,17 @@ static int basic_fasta(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
         calculate_consensus_gap5m(pos, opts->use_mqual ? CONS_MQUAL : 0,
                                   depth, p, opts, &cons, opts->default_qual,
                                   &cons_prob_recall, &cons_prob_precise);
-        if (cons.het_logodd > 0 && opts->ambig) {
+        if (cons.depth < opts->min_depth) {
+            cb = 'N';
+            cq = 0;
+        } else if (cons.het_logodd > 0 && opts->ambig) {
             cb = "AMRWa" // 5x5 matrix with ACGT* per row / col
                  "MCSYc"
                  "RSGKg"
                  "WYKTt"
                  "acgt*"[cons.het_call];
             cq = cons.het_logodd;
-        } else{
+        } else {
             cb = "ACGT*"[cons.call];
             cq = cons.phred;
         }
@@ -2305,10 +2327,10 @@ static void usage_exit(FILE *fp, int exit_status) {
     fprintf(fp, "  --show-ins yes/no     Whether to show insertions [yes]\n");
     fprintf(fp, "  --mark-ins            Add '+' before every inserted base/qual [off]\n");
     fprintf(fp, "  -A, --ambig           Enable IUPAC ambiguity codes [off]\n");
+    fprintf(fp, "  -d, --min-depth INT   Minimum depth of INT [1]\n");
     fprintf(fp, "\nFor simple consensus mode:\n");
     fprintf(fp, "  -q, --(no-)use-qual   Use quality values in calculation [off]\n");
     fprintf(fp, "  -c, --call-fract INT  At least INT portion of bases must agree [0.75]\n");
-    fprintf(fp, "  -d, --min-depth INT   Minimum depth of INT [2]\n");
     fprintf(fp, "  -H, --het-fract INT   Minimum fraction of 2nd-most to most common base [0.15]\n");
     fprintf(fp, "\nFor default \"Bayesian\" consensus mode:\n");
     fprintf(fp, "  -C, --cutoff C        Consensus cutoff quality C [10]\n");
@@ -2712,6 +2734,13 @@ int main_consensus(int argc, char **argv) {
             if (empty_pileup2(&opts, opts.h, tid, pos, len) < 0)
                 goto err;
         }
+        while (!opts.iter && opts.all_bases > 1 &&
+               ++opts.last_tid < opts.h->n_targets) {
+            int len = sam_hdr_tid2len(opts.h, opts.last_tid);
+            if (empty_pileup2(&opts, opts.h, opts.last_tid, 0, len) < 0)
+                goto err;
+        }
+
     } else {
         if (pileup_loop(opts.fp, opts.h, readaln2,
                         opts.mode != MODE_SIMPLE ? nm_init : NULL,
@@ -2719,6 +2748,8 @@ int main_consensus(int argc, char **argv) {
                         opts.mode != MODE_SIMPLE ? nm_free : NULL,
                         &opts) < 0)
             goto err;
+
+    next_ref_q:
         if (opts.all_bases) {
             // fill out terminator
             int tid = opts.iter ? opts.iter->tid : opts.last_tid;
@@ -2746,6 +2777,13 @@ int main_consensus(int argc, char **argv) {
             dump_fastq(&opts, sam_hdr_tid2name(opts.h, opts.last_tid),
                        opts.ks_ins_seq.s,  opts.ks_ins_seq.l,
                        opts.ks_ins_qual.s, opts.ks_ins_qual.l);
+
+        if (!opts.iter && opts.all_bases > 1 &&
+            ++opts.last_tid < opts.h->n_targets) {
+            opts.last_pos = 0;
+            opts.ks_ins_seq.l = opts.ks_ins_qual.l = 0;
+            goto next_ref_q;
+        }
 //        if (consensus_loop(&opts) < 0) {
 //            print_error_errno("consensus", "Failed");
 //            goto err;

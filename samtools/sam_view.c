@@ -1,6 +1,6 @@
 /*  sam_view.c -- SAM<->BAM<->CRAM conversion.
 
-    Copyright (C) 2009-2023 Genome Research Ltd.
+    Copyright (C) 2009-2024 Genome Research Ltd.
     Portions copyright (C) 2009, 2011, 2012 Broad Institute.
 
     Author: Heng Li <lh3@sanger.ac.uk>
@@ -54,6 +54,8 @@ typedef struct samview_settings {
     strhash_t rnhash;
     strhash_t tvhash;
     int min_mapQ;
+    int rghash_discard; // 0 keep, 1 discard
+    int rnhash_discard; // 0 keep, 1 discard
 
     // Described here in the same terms as the usage statement.
     // The code however always negates to "reject if"         keep if:
@@ -139,11 +141,17 @@ static inline uint8_t *skip_aux(uint8_t *s, uint8_t *end)
     }
 }
 
-// Returns 0 to indicate read should be output 1 otherwise
+// Returns 0 to indicate read should be output 1 otherwise,
+// and -1 on error.
 static int process_aln(const sam_hdr_t *h, bam1_t *b, samview_settings_t* settings)
 {
-    if (settings->filter && sam_passes_filter(h, b, settings->filter) < 1)
-        return 1;
+    if (settings->filter) {
+        int r = sam_passes_filter(h, b, settings->filter);
+        if (r < 0)  // err
+            return -1;
+        if (r == 0) // filter-out
+            return 1;
+    }
 
     if (settings->remove_B) bam_remove_B(b);
     if (settings->min_qlen > 0) {
@@ -170,7 +178,8 @@ static int process_aln(const sam_hdr_t *h, bam1_t *b, samview_settings_t* settin
         uint8_t *s = bam_aux_get(b, "RG");
         if (s) {
             khint_t k = kh_get(str, settings->rghash, (char*)(s + 1));
-            if (k == kh_end(settings->rghash)) return 1;
+            if ((k == kh_end(settings->rghash)) != settings->rghash_discard)
+                return 1;
         }
     }
     if (settings->tag) {
@@ -198,9 +207,11 @@ static int process_aln(const sam_hdr_t *h, bam1_t *b, samview_settings_t* settin
     }
     if (settings->rnhash) {
         const char* rn = bam_get_qname(b);
-        if (!rn || kh_get(str, settings->rnhash, rn) == kh_end(settings->rnhash)) {
+        strhash_t h = settings->rnhash;
+        if (!rn && !settings->rnhash_discard)
             return 1;
-        }
+        if ((kh_get(str, h, rn) == kh_end(h)) != settings->rnhash_discard)
+            return 1;
     }
     if (settings->library) {
         const char *p = bam_get_library((sam_hdr_t*)h, b);
@@ -299,7 +310,12 @@ static int add_read_group_single(const char *subcmd, samview_settings_t *setting
     if (settings->rghash == NULL) {
         settings->rghash = kh_init(str);
         if (settings->rghash == NULL) goto err;
+    } else if (settings->rghash_discard == 1) {
+        print_error("view", "cannot mix include and exclude read-group files in the same command line");
+        free(d);
+        return -1;
     }
+    settings->rghash_discard = 0;
 
     kh_put(str, settings->rghash, d, &ret);
     if (ret == -1) goto err;
@@ -320,8 +336,14 @@ static int add_read_names_file(const char *subcmd, samview_settings_t *settings,
             perror(NULL);
             return -1;
         }
+    } else if ((settings->rnhash_discard == 0 && *fn == '^') ||
+        (settings->rnhash_discard == 1 && *fn != '^')) {
+        print_error("view", "cannot mix include and exclude read-name files in the same command line");
+        return -1;
     }
-    return populate_lookup_from_file(subcmd, settings->rnhash, fn);
+    settings->rnhash_discard = (*fn == '^');
+    return populate_lookup_from_file(subcmd, settings->rnhash,
+                                     fn + (*fn == '^'));
 }
 
 static int add_read_groups_file(const char *subcmd, samview_settings_t *settings, char *fn)
@@ -332,8 +354,14 @@ static int add_read_groups_file(const char *subcmd, samview_settings_t *settings
             perror(NULL);
             return -1;
         }
+    } else if ((settings->rghash_discard == 0 && *fn == '^') ||
+        (settings->rghash_discard == 1 && *fn != '^')) {
+        print_error("view", "cannot mix include and exclude read-group files in the same command line");
+        return -1;
     }
-    return populate_lookup_from_file(subcmd, settings->rghash, fn);
+    settings->rghash_discard = (*fn == '^');
+    return populate_lookup_from_file(subcmd, settings->rghash,
+                                     fn + (*fn == '^'));
 }
 
 static int add_tag_value_single(const char *subcmd, samview_settings_t *settings, char *name)
@@ -527,12 +555,20 @@ hts_itr_multi_t *multi_region_init(samview_settings_t *conf, char **regs, int nr
     int filter_state = ALL;
     if ( nregs ) {
         int filter_op = 0;
-        conf->bed = bed_hash_regions(conf->bed, regs, 0, nregs, &filter_op); // insert(1) or filter out(0) the regions from the command line in the same hash table as the bed file
+        void *bed = bed_hash_regions(conf->bed, regs, 0, nregs, &filter_op); // insert(1) or filter out(0) the regions from the command line in the same hash table as the bed file
+        if (!bed) {
+            print_error_errno("view", "Couldn't %s region list",
+                              filter_op ? "build" : "filter");
+            return NULL;
+        }
+        conf->bed = bed;
         if ( !filter_op )
             filter_state = FILTERED;
     }
     else
         bed_unify(conf->bed);
+
+    // This check is probably redundant, but left just in case
     if ( !conf->bed) { // index is unavailable or no regions have been specified
         print_error("view", "No regions or BED file have been provided. Aborting.");
         return NULL;
@@ -581,7 +617,9 @@ static int fetch_pairs_collect_mates(samview_settings_t *conf, hts_itr_multi_t *
     while ((r =sam_itr_multi_next(conf->in, iter, rec))>=0) {
         if ( (rec->core.flag & BAM_FPAIRED) == 0 ) continue;
         if ( rec->core.mtid>=0 && bed_overlap(conf->bed, sam_hdr_tid2name(conf->header,rec->core.mtid), rec->core.mpos, rec->core.mpos) ) continue;
-        if ( process_aln(conf->header, rec, conf) ) continue;
+        int p = process_aln(conf->header, rec, conf);
+        if (p < 0)  goto out;
+        if (p == 1) continue;
 
         nmates++;
 
@@ -601,8 +639,9 @@ static int fetch_pairs_collect_mates(samview_settings_t *conf, hts_itr_multi_t *
             }
         }
 
-        if ( rec->core.mtid < 0 || (rec->core.flag & BAM_FMUNMAP) ) nunmap = 1;
-        if ( rec->core.mtid >= 0 ) {
+        if ( rec->core.mtid < 0 ) {
+            nunmap = 1;
+        } else {
             if (_reglist_push(&conf->reglist, &conf->nreglist, rec->core.mtid, rec->core.mpos,rec->core.mpos+1) != 0)
                 goto out;
         }
@@ -632,13 +671,16 @@ static int fetch_pairs_collect_mates(samview_settings_t *conf, hts_itr_multi_t *
              k = kh_get(names,mate_names,bam_get_qname(rec));
              if ( k != kh_end(mate_names) ) drop = 0;
         }
-        if (!drop && process_aln(conf->header, rec, conf) == 0) {
+        int p = 0;
+        if (!drop && (p=process_aln(conf->header, rec, conf))== 0) {
             if (adjust_tags(conf->header, rec, conf) != 0)
                 goto out;
             if (check_sam_write1(conf->out, conf->header, rec, conf->fn_out,
                                  &write_error) < 0)
                 goto out;
         }
+        if (p < 0)
+            goto out;
     }
 
     if (r < -1) {
@@ -669,7 +711,12 @@ static inline int process_one_record(samview_settings_t *conf, bam1_t *b,
         if (bam_sanitize(conf->header, b, conf->sanitize) < 0)
             return -1;
 
-    if (!process_aln(conf->header, b, conf)) {
+    int p;
+    if ((p = process_aln(conf->header, b, conf)) < 0) {
+        // error
+        return -1;
+    } else if (p == 0) {
+        // emit read
         if (!conf->is_count) {
             change_flag(b, conf);
             if (adjust_tags(conf->header, b, conf) != 0)
@@ -710,17 +757,17 @@ static inline int process_one_record(samview_settings_t *conf, bam1_t *b,
 
 static int stream_view(samview_settings_t *conf) {
     bam1_t *b = bam_init1();
-    int write_error = 0, r;
+    int write_error = 0, r, p = 0;
     if (!b) {
         print_error_errno("view", "could not allocate bam record");
         return 1;
     }
     errno = 0; // prevent false error messages.
     while ((r = sam_read1(conf->in, conf->header, b)) >= 0) {
-        if (process_one_record(conf, b, &write_error) < 0) break;
+        if ((p = process_one_record(conf, b, &write_error)) < 0) break;
     }
     bam_destroy1(b);
-    if (r < -1) {
+    if (r < -1 || p < 0) {
         print_error_errno("view", "error reading file \"%s\"", conf->fn_in);
         return 1;
     }
@@ -739,13 +786,13 @@ static int multi_region_view(samview_settings_t *conf, hts_itr_multi_t *iter)
     while ((result = sam_itr_multi_next(conf->in, iter, b)) >= 0) {
         if (process_one_record(conf, b, &write_error) < 0) break;
     }
-    hts_itr_multi_destroy(iter);
     bam_destroy1(b);
 
     if (result < -1) {
         print_error("view", "retrieval of region #%d failed", iter->curr_tid);
-        return 1;
+        write_error = 1;
     }
+    hts_itr_multi_destroy(iter);
     return write_error;
 }
 
@@ -837,6 +884,7 @@ int main_samview(int argc, char *argv[])
         {"use-index", no_argument, NULL, 'M'},
         {"with-header", no_argument, NULL, 'h'},
         {"sanitize", required_argument, NULL, 'z'},
+        {NULL, 0, NULL, 0}
     };
 
     /* parse command-line options */
@@ -852,6 +900,8 @@ int main_samview(int argc, char *argv[])
     opterr = 0;
 
     char *tmp;
+    int tmp_flag;
+
     while ((c = getopt_long(argc, argv,
                             "SbBcCt:h1Ho:O:q:f:F:G:ul:r:T:R:N:d:D:L:s:@:m:x:U:MXe:pPz:",
                             lopts, NULL)) >= 0) {
@@ -896,19 +946,47 @@ int main_samview(int argc, char *argv[])
         case 'U': settings.fn_un_out = strdup(optarg); break;
         case 'X': has_index_file = 1; break;
         case 'f':
-            settings.flag_on |= bam_str2flag(optarg);
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.flag_on |= tmp_flag;
             settings.count_rf |= SAM_FLAG | SAM_RNEXT;
             break;
         case 'F':
-            settings.flag_off |= bam_str2flag(optarg);
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.flag_off |= tmp_flag;
             settings.count_rf |= SAM_FLAG | SAM_RNEXT;
             break;
         case LONGOPT('g'):
-            settings.flag_anyon |= bam_str2flag(optarg);
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.flag_anyon |= tmp_flag;
             settings.count_rf |= SAM_FLAG | SAM_RNEXT;
             break;
         case 'G':
-            settings.flag_alloff |= bam_str2flag(optarg);
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.flag_alloff |= tmp_flag;
             settings.count_rf |= SAM_FLAG | SAM_RNEXT;
             break;
         case 'q':
@@ -1068,8 +1146,27 @@ int main_samview(int argc, char *argv[])
             }
             settings.count_rf = INT_MAX; // no way to know what we need
             break;
-        case LONGOPT('r'): settings.remove_flag |= bam_str2flag(optarg); break;
-        case LONGOPT('a'): settings.add_flag |= bam_str2flag(optarg); break;
+        case LONGOPT('r'):
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.remove_flag |= tmp_flag;
+            break;
+
+        case LONGOPT('a'):
+            tmp_flag = bam_str2flag(optarg);
+
+            if (tmp_flag < 0) {
+                print_error("view", "Unknown flag '%s'", optarg);
+                return 1;
+            }
+
+            settings.add_flag |= tmp_flag;
+            break;
 
         case 'x':
             if (*optarg == '^') {
@@ -1338,8 +1435,6 @@ int main_samview(int argc, char *argv[])
         }
     }
 
-    if ( settings.hts_idx ) hts_idx_destroy(settings.hts_idx);
-
     if (ga.write_index) {
         if (sam_idx_save(settings.out) < 0) {
             print_error_errno("view", "writing index failed");
@@ -1352,6 +1447,8 @@ int main_samview(int argc, char *argv[])
     }
 
 view_end:
+    if ( settings.hts_idx ) hts_idx_destroy(settings.hts_idx);
+
     if (settings.is_count && ret == 0) {
         if (fprintf(settings.fn_out? fp_out : stdout, "%" PRId64 "\n", settings.count) < 0) {
             if (settings.fn_out) print_error_errno("view", "writing to \"%s\" failed", settings.fn_out);
@@ -1442,9 +1539,10 @@ static int usage(FILE *fp, int exit_status, int is_long_help)
 "\n"
 "Filtering options (Only include in output reads that...):\n"
 "  -L, --target[s]-file FILE  ...overlap (BED) regions in FILE\n"
+"  -N, --qname-file [^]FILE   ...whose read name is listed in FILE (\"^\" negates)\n"
 "  -r, --read-group STR       ...are in read group STR\n"
-"  -R, --read-group-file FILE ...are in a read group listed in FILE\n"
-"  -N, --qname-file FILE      ...whose read name is listed in FILE\n"
+"  -R, --read-group-file [^]FILE\n"
+"                             ...are in a read group listed in FILE\n"
 "  -d, --tag STR1[:STR2]      ...have a tag STR1 (with associated value STR2)\n"
 "  -D, --tag-file STR:FILE    ...have a tag STR whose value is listed in FILE\n"
 "  -q, --min-MQ INT           ...have mapping quality >= INT\n"
@@ -1618,7 +1716,7 @@ int main_head(int argc, char *argv[])
     if (nrecords > 0) {
         b = bam_init1();
         uint64_t n;
-        int r;
+        int r = 0;
         for (n = 0; n < nrecords && (r = sam_read1(fp, hdr, b)) >= 0; n++) {
             if (sam_format1(hdr, b, &str) < 0) {
                 print_error_errno("head", "couldn't format record");

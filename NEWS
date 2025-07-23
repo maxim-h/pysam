@@ -1,17 +1,126 @@
-An online version of the installation instructions can be found here:
-http://pysam.readthedocs.io/en/latest/release.html
+.. An online version of the release history can be found here:
+.. http://pysam.readthedocs.io/en/latest/release.html
 
-=============
-Release notes
-=============
+Release 0.22.1
+==============
+
+.. rubric:: 24 April 2024
+
+Bugfix release, which still wraps htslib/samtools/bcftools 1.18.
+
+Bugs fixed:
+
+* Preserve all header field tags defined in the SAM specification (notably TP)
+  in :meth:`.AlignmentHeader.from_dict` and :meth:`.AlignmentHeader.to_dict`
+  (#1237, PR #1238, thanks to Tim Fennell and Nils Homer)
+
+* Adjust HTSlib's Makefile so that ``make distclean`` no longer tries to
+  rebuild the htscodecs configury (PR #1247, reported by Nicola Soranzo)
+
+* Reinstate S3 support in pre-built Linux wheels: support for this protocol
+  was inadvertently omitted from the pre-built 0.22.0 wheels on Linux
+  (#1249, #1277, etc varying circumstances; likely it is this that was
+  reported by Mathew Baines, Benjamin Sargsyan, et al)
+
+* Add missing :attr:`.AlignedSegment.is_mapped` etc properties to type stubs
+  (PR #1273, thanks to Matt Stone)
+
+* Fix off-by-one NamedTupleProxy, :class:`.asBed`, etc array bounds check
+  (#1279, reported by Dan Bolser)
+
+* Make pysam's klib headers compatible with C++ (reported by Martin Grigorov)
+
+
+Release 0.22.0
+==============
+
+.. rubric:: 5 October 2023
+
+This pysam release wraps htslib/samtools/bcftools 1.18 (PR #1208).
+
+It has been tested with Python versions 3.6 through 3.12, and wheels are
+available via PyPI_ for all of those Python versions. Python versions 3.6
+and 3.7 are end-of-life; particularly if you use pysam with either of
+these versions, please vote in the version survey at issue #1230.
+
+The final pysam release that supported Python 2.7 was v0.20.0.
+
+Bugs fixed:
+
+* Remove Cython from runtime dependencies (PR #1186, thanks to Nicola Soranzo,
+  also reported by Arya Massarat in PR #1194)
+
+* Miscellaneous dependency improvements (PR #1216, #1217, PR #1218, PR #1219,
+  thanks to Martin Larralde and Arthur Vigil)
+
+* Suppress spurious "Could not retrieve index file" message when opening an
+  AlignmentFile (#939, #1214, reported by ChengYong Tham and Sebastian Röner)
+
+* Propagate SAM parsing errors encounted in :meth:`.AlignedSegment.fromstring`
+  (#1196, reported by DV Klopfenstein)
+
+* Accept invalid MD:A tagged fields produced by HTSeq instead of crashing
+  in :meth:`AlignedSegment.get_aligned_pairs(with_seq=True)
+  <.AlignedSegment.get_aligned_pairs>` (#1226, reported by Isaac Vock)
+
+* Fix multiarch macOS CI builds by removing brewed liblzma (#1205, reported
+  by Till Hartmann)
+
+* Fix :attr:`.VariantRecordSample.alleles` type hint (#1179, reported by
+  David Seifert)
+
+New functionality:
+
+* Add optional :meth:`HTSFile.seek(..., whence) <.HTSFile.seek>` parameter
+  and clarify which functions use libc.SEEK_SET vs io.SEEK_SET
+  (#1185, requested by luyulin)
+
+* File handling improvements in samtools & bcftools commands (should improve
+  #1193 and #1195, reported by Rob Bierman and Sam Chorlton)
+
+* Improve :class:`.FastxFile` performance (PR #1227, thanks to Fabian Klötzl
+  and Valentyn Bezshapkin)
+
+* Improve the accuracy of type hints for :class:`.AlignmentFile` iteration
+  (#1184, PR #1189, reported by @PikalaxALT)
+
+Documentation improvements:
+
+* Clarify that :meth:`.AlignedSegment.get_aligned_pairs` results are 0-based
+  (#1180, reported by Nick Semenkovich)
+
+* Clarify :meth:`.AlignedSegment.get_reference_positions` documentation
+  (#836, #838, reported by Liang Ou and Nick Stoler)
+
+* Clarify that installation via pip usually uses a wheel, and that configuring
+  the build via $HTSLIB_CONFIGURE_OPTIONS etc only applies when installing from
+  an sdist (#1086, reported by Layne Sadler)
+
+A message from pysam's founder, Andreas Heger:
+
+    As many of you will have noticed, John Marshall has been effectively
+    maintaining pysam and supporting users over the last few years.
+    I, Andreas, am very grateful for the countless hours he has contributed.
+    Unfortunately, I will not be able to contribute much in the near and
+    intermediate future. To keep pysam going, John has kindly agreed to
+    continue maintaining and supporting pysam as the principal developer
+    of pysam. I am very happy to know that pysam is in good hands and want
+    to thank again John and the wider pysam community for their suggestions,
+    bug reports, code contributions and general support.
+
+Thank you Andreas for all your work over the years and the solid foundations
+that pysam enjoys and the useful functionality it provides.
+
 
 Release 0.21.0
 ==============
 
+.. rubric:: 2 April 2023
+
 This release wraps htslib/samtools/bcftools version 1.17.
 
-Pysam is now compatible with Python 3.11. We have removed python 2.x
-support. Pysam is tested with python versions 3.6 to 3.11.
+Pysam is now compatible with Python 3.11. We have removed Python 2.x
+support. Pysam is tested with Python versions 3.6 to 3.11.
 
 * [#1175] VariantHeader.new_record: set start/stop before alleles
 * [#1173] Add multiple build improvements in htscodecs on multi-arch macOS
@@ -27,8 +136,11 @@ support. Pysam is tested with python versions 3.6 to 3.11.
 * [#1149] MacOS universal build compatibility.
 * [#1146] Fix build when CFLAGS/etc environment variables are set.
 
+
 Release 0.20.0
 ==============
+
+.. rubric:: 29 October 2022
 
 This release wraps htslib/bcftools version 1.16 and samtools version 1.16.1.
 
@@ -40,16 +152,22 @@ This release wraps htslib/bcftools version 1.16 and samtools version 1.16.1.
 Many additional type hints have been provided by the community,
 thanks!
 
+
 Release 0.19.1
 ==============
+
+.. rubric:: 27 May 2022
 
 This release wraps htslib/samtools/bcftools version 1.15.1.
 
 * [#1104] add an add_samples() method to quickly add multiple samples
   to VCF.
 
+
 Release 0.19.0
 ==============
+
+.. rubric:: 30 March 2022
 
 This release wraps htslib/samtools/bcftools version 1.15.
 
@@ -66,9 +184,12 @@ This release wraps htslib/samtools/bcftools version 1.15.
 * Fix BGZFile.read() behaviour near or at EOF
 
 * First API for the htslib modified bases interface
-  
+
+
 Release 0.18.0
 ==============
+
+.. rubric:: 17 November 2021
 
 This release wraps htslib/samtools/bcftools version 1.14.
 
@@ -77,8 +198,11 @@ This release wraps htslib/samtools/bcftools version 1.14.
 * Add new "samples" subcommand to pysam/samtools.py
 * Introduce TupleProxyIterator iterator object class
 
+
 Release 0.17.0
 ==============
+
+.. rubric:: 30 September 2021
 
 This release wraps htslib/samtools/bcftools version 1.13. Corresponding
 to new samtools commands, `pysam.samtools` now has additional functions
@@ -122,6 +246,8 @@ Documentation improvements:
 Release 0.16.0
 ==============
 
+.. rubric:: 8 June 2020
+
 This release wraps htslib/bcftools version 1.10.2 and samtools version
 1.10. The following bugs reported against pysam are fixed due to this:
 
@@ -161,6 +287,7 @@ version in order to fix pip install pysam with python 3.8.
 * [#841] Fix silent truncation of FASTQ with bad q strings
 * [#846] Prevent segmentation fault on ID, when handling malformed records
 * [#829] Run configure with the correct CC/CFLAGS/LDFLAGS env vars
+
 
 Release 0.15.3
 ==============
@@ -205,7 +332,7 @@ Bugfix release.
 Release 0.15.0
 ==============
 
-This release wraps htslib (and friends) version 1.9.
+This release wraps htslib/samtools/bcftools version 1.9.
 
 * [#673] permit dash in chromosome name of region string
 * [#656] Support `text` when opening a SAM file for writing
@@ -224,6 +351,7 @@ upgraded to 1.7.0.
 * [#635] Speed-up of AlignedSegment.find_intro()
 * treat border case of all bases in pileup column below quality score
 * [#634] Fix access to pileup reference_sequence
+
 
 Release 0.14.0
 ==============
@@ -289,6 +417,7 @@ contains a series of bugfixes.
 * [#537] allow tabix index files to be created in a custom location.
 * [#530] add get_index_statistics() method
 
+
 Release 0.12.0.1
 ================
 
@@ -304,6 +433,7 @@ contains a series of bugfixes.
 * [#473] A new FastxRecord class that can be instantiated from class and
   modified in-place. Replaces PersistentFastqProxy.
 * [#521] In AligmentFile, Simplify file detection logic and allow remote index files
+
   * Removed attempts to guess data and index file names; this is magic left
     to htslib.
   * Removed file existence check prior to opening files with htslib
@@ -314,6 +444,7 @@ contains a series of bugfixes.
   * Allow remote indices (tested using S3 signed URLs).
   * Document filepath_index and make it an alias for index_filename.
   * Added a require_index parameter to AlignmentFile
+
 * [#526] handle unset ref when creating new records
 * [#513] fix bcf_translate to skip deleted FORMAT fields to avoid
   segfaults
@@ -554,12 +685,14 @@ Potential isses when upgrading from v0.8.3:
 
 * renamed several methods for pep8 compatibility, old names still retained for
   backwards compatibility, but should be considered deprecated.
+
    * gettid() is now get_tid()
    * getrname() is now get_reference_name()
    * parseRegion() is now parse_region()
 
 * some methods have changed for pep8 compatibility without the old
   names being present:
+
    * fromQualityString() is now qualitystring_to_array()
    * toQualityString() is now qualities_to_qualitystring()
 
@@ -678,6 +811,7 @@ Release 0.8.1
 * Pysam now wraps htslib and samtools versions 1.1.
 
 * Bugfixes, most notable:
+
   * issue #43: uncompressed BAM output
   * issue #42: skip tests requiring network if none available
   * issue #19: multiple iterators can now be made to work on the same tabix file

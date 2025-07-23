@@ -11,7 +11,7 @@
 # All configuration values have a default; values that are commented out
 # serve to show the default.
 
-import sys, os, setuptools
+import sys, os, re, setuptools
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -29,6 +29,7 @@ if os.path.exists(_libdir):
 # coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.autosummary',
+              'sphinx.ext.extlinks',
               'sphinx.ext.todo', 
               'sphinx.ext.ifconfig',
               'sphinx.ext.intersphinx',
@@ -50,7 +51,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'pysam'
-copyright = u'2009–2021, Andreas Heger, Kevin Jacobs, et al'
+copyright = '2009–2024 Andreas Heger, John Marshall, Kevin Jacobs, et al'
 
 # Included at the end of each rst file
 rst_epilog = '''
@@ -63,7 +64,7 @@ rst_epilog = '''
 .. _Galaxy: https://main.g2.bx.psu.edu/
 .. _cython: https://cython.org/
 .. _python: https://www.python.org/
-.. _pypi: https://pypi.org/
+.. _PyPI: https://pypi.org/
 .. _pip: https://pip.pypa.io/
 .. _pyximport: https://github.com/cython/cython/tree/master/pyximport
 .. _conda: https://conda.io/docs/
@@ -120,12 +121,33 @@ pygments_style = 'sphinx'
 # A list of ignored prefixes for module index sorting.
 #modindex_common_prefix = []
 
+# -- Rewrite "PR #NNN" and "#NNN" in NEWS as URL links -------------------------
+
+extlinks = {
+    'issue': ('https://github.com/pysam-developers/pysam/issues/%s', '#%s'),
+    'pull':  ('https://github.com/pysam-developers/pysam/pull/%s', 'PR #%s'),
+    }
+
+def expand_github_references(text):
+    text = re.sub(r'PR\s*#(\d+)', r':pull:`\1`', text)
+    text = re.sub(r'#(\d+)', r':issue:`\1`', text)
+    return text
+
+def include_read(app, relative_path, parent_docname, source):
+    if relative_path.name == 'NEWS':
+        source[0] = expand_github_references(source[0])
+
+def setup(app):
+    try:
+        app.connect('include-read', include_read)
+    except:
+        pass  # Sphinx is too old to link issues/PRs
 
 # -- Options for HTML output ---------------------------------------------------
 
 # The theme to use for HTML and HTML Help pages.  Major themes that come with
 # Sphinx are currently 'default' and 'sphinxdoc'.
-html_theme = 'default'
+html_theme = 'sphinx_rtd_theme'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
@@ -207,7 +229,7 @@ htmlhelp_basename = 'samtoolsdoc'
 # (source start file, target name, title, author, documentclass [howto/manual]).
 latex_documents = [
     ('index', 'pysam.tex', u'pysam documentation',
-     u'Andreas Heger, Kevin Jacobs, et al.', 'manual'),
+     'Andreas Heger, John Marshall, Kevin Jacobs, et al', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of

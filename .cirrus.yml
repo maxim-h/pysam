@@ -1,3 +1,24 @@
+freebsd_ci_task:
+  name: CI / FreeBSD
+
+  freebsd_instance:
+    image_family: freebsd-14-2
+
+  install_script: |
+    pkg install -y bcftools gmake py311-cython3 py311-mypy py311-pytest samtools
+
+  env:
+    CC: "clang -I/usr/local/include"
+    MAKE: "gmake"
+    REF_PATH: ":"
+
+  build_script: |
+    python setup.py build
+
+  test_script: |
+    PYTHONPATH="$(echo $PWD/build/lib.*)" pytest
+
+
 build_wheels_task:
   only_if: $CIRRUS_BRANCH =~ "release/.*" || $CIRRUS_TAG =~ "v0\..*"
 
@@ -8,18 +29,21 @@ build_wheels_task:
         architecture: arm64
         platform: linux
       matrix:
-        - name: Build ARM Linux py3.6-9 wheels
+        - name: Build ARM Linux py3.8-9 wheels
           env:
-            CIBW_BUILD: "cp36-* cp37-* cp38-* cp39-*"
-        - name: Build ARM Linux py3.10-12 wheels
+            CIBW_BUILD: "cp38-* cp39-*"
+        - name: Build ARM Linux py3.10-11 wheels
           env:
-            CIBW_BUILD: "cp310-* cp311-* cp312-*"
+            CIBW_BUILD: "cp310-* cp311-*"
+        - name: Build ARM Linux py3.12-13 wheels
+          env:
+            CIBW_BUILD: "cp312-* cp313-*"
 
     - name: Build ARM macOS wheels
       macos_instance:
         image: ghcr.io/cirruslabs/macos-sonoma-base:latest
       env:
-        CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-*"
+        CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
 
   alias: build_wheels
 
@@ -29,14 +53,17 @@ build_wheels_task:
     VENV: $HOME/relenv
     PATH: $VENV/bin:$PATH
 
-    CIBW_SKIP: "*-musllinux_*"
     CIBW_BUILD_VERBOSITY: 1
 
+    # Avoid linking with non-system library libdeflate.dylib
+    CIBW_ENVIRONMENT_MACOS: HTSLIB_CONFIGURE_OPTIONS="--without-libdeflate"
+
     CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+    CIBW_MUSLLINUX_AARCH64_IMAGE: musllinux_1_2
 
   install_script: |
     python3 -m venv $VENV
-    pip3 install cibuildwheel==2.17.0
+    pip3 install cibuildwheel==2.23.3
 
   build_script: |
     cibuildwheel

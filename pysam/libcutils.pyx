@@ -14,12 +14,12 @@ from cpython cimport PyBytes_Check, PyUnicode_Check
 from cpython cimport array as c_array
 from libc.errno cimport errno
 from libc.stdlib cimport calloc, free
-from libc.string cimport strncpy
+from libc.string cimport strerror, strncpy
 from libc.stdint cimport INT32_MAX, int32_t
 from libc.stdio cimport fprintf, stderr, fflush
 from libc.stdio cimport stdout as c_stdout
 from posix.fcntl cimport open as c_open, O_WRONLY, O_CREAT, O_TRUNC
-from posix.unistd cimport SEEK_SET, SEEK_CUR, SEEK_END
+from posix.unistd cimport dup as c_dup, SEEK_SET, SEEK_CUR, SEEK_END, STDOUT_FILENO
 
 from pysam.libcsamtools cimport samtools_dispatch, samtools_set_stdout, samtools_set_stderr, \
     samtools_close_stdout, samtools_close_stderr, samtools_set_stdout_fn
@@ -175,6 +175,12 @@ cdef decode_bytes(bytes s, encoding=None, errors=None):
         return s.decode(encoding or TEXT_ENCODING, errors or ERROR_HANDLER)
 
 
+cdef OSError_from_errno(message, filename=None):
+    cdef int err = errno
+    if filename is not None: filename = os.fsdecode(filename)
+    return OSError(err, f"{message}: {strerror(err).decode()}", filename)
+
+
 cpdef parse_region(contig=None,
                    start=None,
                    stop=None,
@@ -324,7 +330,7 @@ def _pysam_dispatch(collection,
         stdout_h = c_open(force_bytes(stdout_f),
                           O_WRONLY|O_CREAT|O_TRUNC, 0666)
         if stdout_h == -1:
-            raise OSError(errno, "error while opening file for writing", stdout_f)
+            raise OSError_from_errno("Could not redirect standard output", stdout_f)
 
         samtools_set_stdout_fn(force_bytes(stdout_f))
         bcftools_set_stdout_fn(force_bytes(stdout_f))
@@ -361,7 +367,8 @@ def _pysam_dispatch(collection,
     else:
         samtools_set_stdout_fn("-")
         bcftools_set_stdout_fn("-")
-        stdout_h = c_open(b"/dev/null", O_WRONLY)
+        if catch_stdout is None: stdout_h = c_dup(STDOUT_FILENO)
+        else: stdout_h = c_open(b"/dev/null", O_WRONLY)
 
     # setup the function call to samtools/bcftools main
     cdef char ** cargs

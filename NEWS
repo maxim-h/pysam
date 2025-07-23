@@ -1,6 +1,182 @@
 .. An online version of the release history can be found here:
 .. http://pysam.readthedocs.io/en/latest/release.html
 
+Release 0.23.3
+==============
+
+.. rubric:: 10 June 2025
+
+This is a bugfix release, still wrapping htslib/samtools/bcftools 1.21.
+
+It has been tested with Python versions 3.8 through 3.13, and wheels are
+available via PyPI_ for all of those Python versions. Wheels are built for
+macOS and Linux (manylinux_2_28 and musllinux_1_2) on both ARM and x86-64.
+
+The final pysam release that supported Python 3.6 and 3.7 was v0.23.0.
+
+Bugs fixed:
+
+* Worked around Cython 3.1.2 bug whereby a new Cython-internal function
+  incorrectly triggered the pysam build system's duplicate symbol check.
+
+
+Release 0.23.2
+==============
+
+.. rubric:: 6 June 2025
+
+This is a bugfix release, still wrapping htslib/samtools/bcftools 1.21.
+
+It has been tested with Python versions 3.8 through 3.13, and wheels are
+available via PyPI_ for all of those Python versions. Wheels are built for
+macOS and Linux (manylinux_2_28 and musllinux_1_2) on both ARM and x86-64.
+
+Bugs fixed:
+
+* Pysam 0.23.1 inadvertently broke binary compatibility for Cython projects
+  by changing the size of :class:`.AlignedSegment`. That class has been
+  restored to its previous size, so v0.23.2 restores binary compatibility
+  with Cython projects previously compiled against v0.23.0 and earlier.
+  (This bug does not affect pure Python projects using pysam.)
+
+* Improved I/O exception messages in :class:`.AlignmentFile` and
+  :class:`.VariantFile`, and ensured that error codes returned by all
+  HTSlib function invocations result in an exception being raised.
+
+
+Release 0.23.1
+==============
+
+.. rubric:: 28 May 2025
+
+This is a bugfix release, still wrapping htslib/samtools/bcftools 1.21.
+
+It has been tested with Python versions 3.8 through 3.13, and wheels are
+available via PyPI_ for all of those Python versions. Wheels are built for
+macOS and Linux (manylinux_2_28 and musllinux_1_2) on both ARM and x86-64.
+
+    This release inadvertently broke binary compatibility for Cython projects.
+    This should not affect Python projects using pysam. However Cython projects
+    should update to release 0.23.2.
+
+Bugs fixed:
+
+* Worked around Cython 3.1.0 behaviour change so that ``pysam.CMATCH`` etc
+  remain as synonyms for ``pysam.CIGAR_OPS.CMATCH`` etc. Note that a future
+  release will remove these synonyms to comply with Cython's new convention.
+  (#1339, PR #1340, reported by Adam Taranto, Andy Bond, et al)
+
+* The Python interpreter no longer exits abruptly on x86-64 Linux
+  when ``pysam.bcftools.*()`` commands terminate with error messages.
+  (#1333, #1335, reported by Maximilian Blacher and Ben Habermeyer)
+
+* Fixed :meth:`.AlignedSegment.get_aligned_pairs` type hint, which now
+  has overloaded hints reflecting the different tuples returned.
+  (PR #1342, thanks to Gosuke Shibahara)
+
+* Corrected "invalid type for record" exception message.
+  (PR #1334, thanks to Gaik Tamazian)
+
+* Fixed :class:`.TabixIterator` error handling. (#1328, reported by @Fan-iX)
+
+* Fixed bugs in the caching of :attr:`.AlignedSegment.query_sequence` and
+  :attr:`.AlignedSegment.query_qualities` values.
+
+* Pysam once again builds on CentOS 7, as it now works around limitations
+  in that obsolete platform's obsolete GCC 4.8.x system compiler.
+  (#1327, reported by Mario Fasold)
+
+New functionality:
+
+* New :attr:`.AlignedSegment.query_qualities_str` property enables
+  accessing the QUAL field as an ASCII-encoded base quality string.
+  The existing :attr:`.AlignedSegment.query_qualities` property can
+  now take an array or such a string when setting the value.
+  (PR #1324, PR #1341, requested by Nils Homer)
+
+* Improved :attr:`.AlignedSegment.cigarstring` performance.
+  (PR #1295, thanks to @limwz01)
+
+* Wheels are now built for musllinux in addition to manylinux and macOS.
+  (Requested by Nils Homer)
+
+
+Release 0.23.0
+==============
+
+.. rubric:: 5 February 2025
+
+This pysam release wraps htslib/samtools/bcftools 1.21 (PR #1310).
+
+It has been tested with Python versions 3.6 through 3.13, and wheels are
+available via PyPI_ for all of those Python versions. Python versions 3.6
+through 3.8 are end-of-life; particularly if you use pysam with one of
+these versions, please vote in the version survey at issue #1230.
+
+This is expected to be the last release supporting Python 3.6 and 3.7.
+
+Bugs fixed:
+
+* Fix :func:`pysam.samtools.command(save_stdout=filename) <.samtools.command>`
+  redirection of output to a file. (#677, reported by Haowen Zhang and analysed
+  by Youri Hoogstrate)
+
+* Reinstate HTTPS/S3/GCS support in pre-built Linux wheels when used on Debian
+  and Ubuntu: these wheels now work around the discrepancy between Red Hat and
+  Debian CA Certificate file locations. (#1257, #1268, reported by Daisie Huang
+  and Li Tai Fang)
+
+* Calling :meth:`.VariantHeader.new_record` repeatedly with the same
+  :obj:`samples` object now sets GT correctly every time. (#1308, reported
+  by Arthur Gymer)
+
+* Correct the exception produced when :meth:`.AlignedSegment.set_tags` is
+  used with an invalid value type. (#1233, PR #1235, reported by Weisheng Wu
+  and Marcus Stoiber)
+
+* Many type hinting corrections. (#1298, #1316, PR #1296, PR #1306, PR #1313,
+  PR #1315, thanks to Victor Epain, Arthur Gymer, @mshunjan, and Matt Stone)
+
+* The undocumented :func:`!pysam.samtools.import_` alias for invoking
+  ``samtools import`` has been removed;
+  use :func:`pysam.samtools.fqimport() <.samtools.command>` instead.
+
+* Corrections to several test data files to account for HTSlib 1.20 and later's
+  improved validity checking. (#1291, reported by David Seifert; etc)
+
+New functionality:
+
+* :meth:`.AlignedSegment.get_aligned_pairs` now optionally returns the
+  associated CIGAR operator in each position tuple. (#1292, PR #1294,
+  thanks to Lara Fuhrmann and Ivan Blagoev Topolsky)
+
+* New :meth:`AlignmentFile.flush() <.HTSFile.flush>` and
+  :meth:`VariantFile.flush() <.HTSFile.flush>` methods for flushing buffered
+  output to streams. (#1299, requested by @blex-max)
+
+* Improved :class:`str() <str>` for :class:`.AlignedSegment` now displays
+  reference sequence names when they are available and uses ``#N`` only when
+  necessary. (#1318, requested by Liu)
+
+* Implement :func:`repr` for :class:`.AlignedSegment` so that it displays the
+  most useful fields. (PR #1267, thanks to Marcel Martin)
+
+* Pysam's tests can now run in parallel. (#1284, reported by Yuri Victorovich)
+
+Documentation improvements:
+
+* More complete documentation of invoking SAMtools and BCFtools subcommands
+  via Pysam. (#1096, #1241, PR #1261, PR #1275, #1323, et al, reported by
+  Seung-been "Steven" Lee, Robert Baldwin, Michael Hall, Indraniel Das,
+  and @shokrofont)
+
+* Use the Pysam names for CIGAR operators rather than internal C names.
+  (#1255, reported by Ilya Shlyakhter)
+
+* Mention :meth:`AlignmentFile.fetch("*") <.AlignmentFile.fetch>` in the
+  FAQ entry on fetching unmapped reads. (#424, reported by Ben Weisburd)
+
+
 Release 0.22.1
 ==============
 
@@ -11,24 +187,24 @@ Bugfix release, which still wraps htslib/samtools/bcftools 1.18.
 Bugs fixed:
 
 * Preserve all header field tags defined in the SAM specification (notably TP)
-  in :meth:`.AlignmentHeader.from_dict` and :meth:`.AlignmentHeader.to_dict`
+  in :meth:`.AlignmentHeader.from_dict` and :meth:`.AlignmentHeader.to_dict`.
   (#1237, PR #1238, thanks to Tim Fennell and Nils Homer)
 
 * Adjust HTSlib's Makefile so that ``make distclean`` no longer tries to
-  rebuild the htscodecs configury (PR #1247, reported by Nicola Soranzo)
+  rebuild the htscodecs configury. (PR #1247, reported by Nicola Soranzo)
 
 * Reinstate S3 support in pre-built Linux wheels: support for this protocol
-  was inadvertently omitted from the pre-built 0.22.0 wheels on Linux
+  was inadvertently omitted from the pre-built 0.22.0 wheels on Linux.
   (#1249, #1277, etc varying circumstances; likely it is this that was
   reported by Mathew Baines, Benjamin Sargsyan, et al)
 
-* Add missing :attr:`.AlignedSegment.is_mapped` etc properties to type stubs
+* Add missing :attr:`.AlignedSegment.is_mapped` etc properties to type stubs.
   (PR #1273, thanks to Matt Stone)
 
-* Fix off-by-one NamedTupleProxy, :class:`.asBed`, etc array bounds check
+* Fix off-by-one NamedTupleProxy, :class:`.asBed`, etc array bounds check.
   (#1279, reported by Dan Bolser)
 
-* Make pysam's klib headers compatible with C++ (reported by Martin Grigorov)
+* Make pysam's klib headers compatible with C++. (reported by Martin Grigorov)
 
 
 Release 0.22.0
@@ -47,54 +223,54 @@ The final pysam release that supported Python 2.7 was v0.20.0.
 
 Bugs fixed:
 
-* Remove Cython from runtime dependencies (PR #1186, thanks to Nicola Soranzo,
+* Remove Cython from runtime dependencies. (PR #1186, thanks to Nicola Soranzo,
   also reported by Arya Massarat in PR #1194)
 
-* Miscellaneous dependency improvements (PR #1216, #1217, PR #1218, PR #1219,
+* Miscellaneous dependency improvements. (PR #1216, #1217, PR #1218, PR #1219,
   thanks to Martin Larralde and Arthur Vigil)
 
 * Suppress spurious "Could not retrieve index file" message when opening an
-  AlignmentFile (#939, #1214, reported by ChengYong Tham and Sebastian Röner)
+  AlignmentFile. (#939, #1214, reported by ChengYong Tham and Sebastian Röner)
 
-* Propagate SAM parsing errors encounted in :meth:`.AlignedSegment.fromstring`
+* Propagate SAM parsing errors encounted in :meth:`.AlignedSegment.fromstring`.
   (#1196, reported by DV Klopfenstein)
 
 * Accept invalid MD:A tagged fields produced by HTSeq instead of crashing
   in :meth:`AlignedSegment.get_aligned_pairs(with_seq=True)
-  <.AlignedSegment.get_aligned_pairs>` (#1226, reported by Isaac Vock)
+  <.AlignedSegment.get_aligned_pairs>`. (#1226, reported by Isaac Vock)
 
-* Fix multiarch macOS CI builds by removing brewed liblzma (#1205, reported
+* Fix multiarch macOS CI builds by removing brewed liblzma. (#1205, reported
   by Till Hartmann)
 
-* Fix :attr:`.VariantRecordSample.alleles` type hint (#1179, reported by
+* Fix :attr:`.VariantRecordSample.alleles` type hint. (#1179, reported by
   David Seifert)
 
 New functionality:
 
 * Add optional :meth:`HTSFile.seek(..., whence) <.HTSFile.seek>` parameter
-  and clarify which functions use libc.SEEK_SET vs io.SEEK_SET
+  and clarify which functions use libc.SEEK_SET vs io.SEEK_SET.
   (#1185, requested by luyulin)
 
-* File handling improvements in samtools & bcftools commands (should improve
+* File handling improvements in samtools & bcftools commands. (should improve
   #1193 and #1195, reported by Rob Bierman and Sam Chorlton)
 
-* Improve :class:`.FastxFile` performance (PR #1227, thanks to Fabian Klötzl
+* Improve :class:`.FastxFile` performance. (PR #1227, thanks to Fabian Klötzl
   and Valentyn Bezshapkin)
 
-* Improve the accuracy of type hints for :class:`.AlignmentFile` iteration
+* Improve the accuracy of type hints for :class:`.AlignmentFile` iteration.
   (#1184, PR #1189, reported by @PikalaxALT)
 
 Documentation improvements:
 
-* Clarify that :meth:`.AlignedSegment.get_aligned_pairs` results are 0-based
+* Clarify that :meth:`.AlignedSegment.get_aligned_pairs` results are 0-based.
   (#1180, reported by Nick Semenkovich)
 
-* Clarify :meth:`.AlignedSegment.get_reference_positions` documentation
+* Clarify :meth:`.AlignedSegment.get_reference_positions` documentation.
   (#836, #838, reported by Liang Ou and Nick Stoler)
 
 * Clarify that installation via pip usually uses a wheel, and that configuring
   the build via $HTSLIB_CONFIGURE_OPTIONS etc only applies when installing from
-  an sdist (#1086, reported by Layne Sadler)
+  an sdist. (#1086, reported by Layne Sadler)
 
 A message from pysam's founder, Andreas Heger:
 
@@ -620,11 +796,11 @@ Overview
 The 0.9.0 release upgrades htslib to htslib 1.3 and numerous other
 enhancements and bugfixes. See below for a detailed list.
 
-`Htslib 1.3 <https://github.com/samtools/htslib/releases/tag/1.3>`_
-comes with additional capabilities for remote file access which depend
-on the presence of optional system libraries. As a consequence, the
-installation script :file:`setup.py` has become more complex. For an
-overview, see :ref:`installation`.  We have tested installation on
+The `Htslib 1.3 <https://github.com/samtools/htslib/releases/tag/1.3>`_
+release comes with additional capabilities for remote file access which
+depend on the presence of optional system libraries. As a consequence,
+the installation script :file:`setup.py` has become more complex. For
+an overview, see :ref:`installation`.  We have tested installation on
 linux and OS X, but could not capture all variations. It is possible
 that a 0.9.1 release might follow soon addressing installation issues.
 

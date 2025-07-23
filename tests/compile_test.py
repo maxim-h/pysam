@@ -10,11 +10,12 @@ pysam and tabix works.
 import os
 import pytest
 import pysam
-from TestUtils import make_data_files, BAM_DATADIR, TABIX_DATADIR
+from TestUtils import make_data_files, BAM_DATADIR, CBCF_DATADIR, TABIX_DATADIR
 
 
 def setUpModule():
     make_data_files(BAM_DATADIR)
+    make_data_files(CBCF_DATADIR)
     make_data_files(TABIX_DATADIR)
 
 
@@ -50,3 +51,30 @@ def test_gtf():
     nread = _compile_test.testCountGTF(
         pysam.Tabixfile(input_filename))
     assert nread == 237
+
+
+class TestBinaryCompatibility:
+    def test_alignments(self):
+        fp = pysam.AlignmentFile(os.path.join(BAM_DATADIR, "ex1.bam"))
+        hdr = pysam.AlignmentHeader()
+        aln = pysam.AlignedSegment()
+
+        assert fp.__sizeof__() == 120
+        assert hdr.__sizeof__() == 24
+        assert aln.__sizeof__() == 72
+
+    def test_tabix(self):
+        gzit = pysam.GZIterator(os.path.join(TABIX_DATADIR, "example.gtf.gz"))
+
+        with open(os.path.join(TABIX_DATADIR, "example.gtf.gz")) as fp:
+            tfit = pysam.tabix_file_iterator(fp, pysam.asTuple())
+
+        assert gzit.__sizeof__() == 80
+        assert tfit.__sizeof__() == 96
+
+    def test_variants(self):
+        fp = pysam.VariantFile(os.path.join(CBCF_DATADIR, "example_vcf43.vcf"))
+        hdr = pysam.VariantHeader()
+
+        assert fp.__sizeof__() == 120
+        assert hdr.__sizeof__() == 32

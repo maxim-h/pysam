@@ -28,9 +28,9 @@ from setuptools.command.sdist import sdist
 from setuptools.extension import Extension
 
 try:
-    from setuptools.errors import LinkError
+    from setuptools.errors import CompileError, LinkError
 except ImportError:
-    from distutils.errors import LinkError
+    from distutils.errors import CompileError, LinkError
 
 try:
     from Cython.Distutils import build_ext
@@ -78,7 +78,7 @@ def run_make(targets):
 
 
 def run_make_print_config():
-    stdout = subprocess.check_output(["make", "-s", "print-config"], encoding="ascii")
+    stdout = subprocess.check_output([os.environ.get("MAKE", "make"), "-s", "print-config"], encoding="ascii")
 
     make_print_config = {}
     for line in stdout.splitlines():
@@ -99,10 +99,13 @@ def run_nm_defined_symbols(objfile):
         if symtype not in "UFNWw":
             if IS_DARWIN:
                 # On macOS, all symbols have a leading underscore
-                symbols.add(sym.lstrip('_'))
+                symbols.add(sym[1:] if sym.startswith("_") else sym)
             else:
                 # Ignore symbols such as _edata (present in all shared objects)
                 if sym[0] not in "_$.@": symbols.add(sym)
+
+    # Work around Cython 3.1.2 bug whereby this function is not static
+    symbols.discard("__pyx_CommonTypesMetaclass_get_module")
 
     return symbols
 
@@ -160,7 +163,7 @@ def write_configvars_header(filename, ext, prefix):
     log.info("creating %s for '%s' extension", filename, ext.name)
     with open(filename, "w") as outf:
         for var, value in config.items():
-            outf.write('#define {}_{} "{}"\n'.format(prefix, var, value))
+            outf.write(f'#define {prefix}_{var} "{value}"\n')
 
 
 @contextmanager
@@ -170,12 +173,12 @@ def set_compiler_envvars():
         if var in os.environ:
             if var == 'CFLAGS' and 'CCSHARED' in sysconfig.get_config_vars():
                 os.environ[var] += ' ' + sysconfig.get_config_var('CCSHARED')
-            print("# pysam: (env) {}={}".format(var, os.environ[var]))
+            print(f"# pysam: (env) {var}={os.environ[var]}")
         elif var in sysconfig.get_config_vars():
             value = sysconfig.get_config_var(var)
             if var == 'CFLAGS' and 'CCSHARED' in sysconfig.get_config_vars():
                 value += ' ' + sysconfig.get_config_var('CCSHARED')
-            print("# pysam: (sysconfig) {}={}".format(var, value))
+            print(f"# pysam: (sysconfig) {var}={value}")
             os.environ[var] = value
             tmp_vars += [var]
 
@@ -184,6 +187,10 @@ def set_compiler_envvars():
     finally:
         for var in tmp_vars:
             del os.environ[var]
+
+
+def format_macro_option(name, value):
+    return f"-D{name}={value}" if value is not None else f"-D{name}"
 
 
 def configure_library(library_dir, env_options=None, options=[]):
@@ -196,8 +203,7 @@ def configure_library(library_dir, env_options=None, options=[]):
         env_options = "--disable-bz2"
 
     if not os.path.exists(configure_script):
-        raise ValueError(
-            "configure script {} does not exist".format(configure_script))
+        raise ValueError(f"configure script {configure_script!r} does not exist")
 
     with changedir(library_dir), set_compiler_envvars():
         if env_options is not None:
@@ -269,6 +275,22 @@ class cy_build_ext(build_ext):
 
         if errors > 0: raise LinkError("symbols defined in multiple extensions")
 
+    def c99_compile_args(self):
+        """Determines whether any compiler flags are needed to ensure C99 compilation."""
+        compiler = getattr(self.compiler, "compiler", "C compiler")
+        if isinstance(compiler, list): compiler = compiler[0]
+        log.info("checking for %s option to enable C99 features...", compiler)
+        for flags in [None, ["-std=c99"], ["-std=gnu99"]]:
+            try:
+                self.compiler.compile(["pysam/conftest_cstd.c"], output_dir=self.build_temp, extra_preargs=flags)
+                log.info("%s option to enable C99 features: %s", compiler, " ".join(flags) if flags else "none needed")
+                return flags
+            except CompileError:
+                log.info("(ignoring errors from test probes)")
+
+        log.error("%s cannot compile C99 source code", compiler)
+        return None
+
     def run(self):
         if sys.platform == 'darwin':
             ldshared = os.environ.get('LDSHARED', sysconfig.get_config_var('LDSHARED'))
@@ -282,6 +304,19 @@ class cy_build_ext(build_ext):
             log.warning("skipping symbol collision check (invoking nm failed: %s)", e)
         except subprocess.CalledProcessError:
             log.warning("skipping symbol collision check (invoking nm failed)")
+
+    def build_extensions(self):
+        c99_flags = self.c99_compile_args()
+        if c99_flags:
+            executables = {}
+            for executable in ["compiler", "compiler_so"]:
+                command = getattr(self.compiler, executable, None)
+                if command:
+                    if isinstance(command, list):  executables[executable] = command + c99_flags
+                    elif isinstance(command, str): executables[executable] = f"{command} {' '.join(c99_flags)}"
+            self.compiler.set_executables(**executables)
+
+        super().build_extensions()
 
     def build_extension(self, ext):
 
@@ -307,7 +342,7 @@ class cy_build_ext(build_ext):
             ext.extra_link_args += ['-dynamiclib',
                                     '-rpath', '@loader_path',
                                     '-Wl,-headerpad_max_install_names',
-                                    '-Wl,-install_name,%s' % library_path,
+                                    f'-Wl,-install_name,{library_path}',
                                     '-Wl,-x']
         else:
             if not ext.extra_link_args:
@@ -389,24 +424,21 @@ config_headers = ["samtools/config.h",
 # the .pyx files. If no cython is available, the C-files included in the
 # distribution will be used.
 if HAVE_CYTHON:
-    print("# pysam: cython is available - using cythonize if necessary")
+    print(f"# pysam: Cython {cython.__version__} is available - using cythonize if necessary")
     source_pattern = "pysam/libc%s.pyx"
 else:
-    print("# pysam: no cython available - using pre-compiled C")
+    print("# pysam: no Cython available - using pre-compiled C")
     source_pattern = "pysam/libc%s.c"
 
 # Exit if there are no pre-compiled files and no cython available
 fn = source_pattern % "htslib"
 if not os.path.exists(fn):
     raise ValueError(
-        "no cython installed, but can not find {}."
-        "Make sure that cython is installed when building "
-        "from the repository"
-        .format(fn))
+        f"no Cython installed, but cannot find {fn}. "
+        "Make sure that Cython is installed when building from the repository")
 
-print("# pysam: htslib mode is {}".format(HTSLIB_MODE))
-print("# pysam: HTSLIB_CONFIGURE_OPTIONS={}".format(
-    HTSLIB_CONFIGURE_OPTIONS))
+print(f"# pysam: htslib mode is {HTSLIB_MODE}")
+print(f"# pysam: HTSLIB_CONFIGURE_OPTIONS={HTSLIB_CONFIGURE_OPTIONS}")
 htslib_configure_options = None
 
 if HTSLIB_MODE in ['shared', 'separate']:
@@ -421,8 +453,7 @@ if HTSLIB_MODE in ['shared', 'separate']:
          "--disable-libcurl"])
 
     HTSLIB_SOURCE = "builtin"
-    print("# pysam: htslib configure options: {}".format(
-        str(htslib_configure_options)))
+    print(f"# pysam: htslib configure options: {htslib_configure_options}")
 
     config_headers += ["htslib/config.h"]
     if htslib_configure_options is None:
@@ -437,7 +468,7 @@ if HTSLIB_MODE in ['shared', 'separate']:
         htslib_make_options = run_make_print_config()
 
     for key, value in htslib_make_options.items():
-        print("# pysam: htslib_config {}={}".format(key, value))
+        print(f"# pysam: htslib_config {key}={value}")
 
     external_htslib_libraries = ['z']
     if "LIBS" in htslib_make_options:
@@ -474,11 +505,11 @@ elif HTSLIB_MODE == 'shared':
     htslib_library_dirs = ["."] # when using setup.py develop?
     htslib_include_dirs = ['htslib']
 else:
-    raise ValueError("unknown HTSLIB value '%s'" % HTSLIB_MODE)
+    raise ValueError(f"unknown HTSLIB value {HTSLIB_MODE!r}")
 
 # build config.py
 with open(os.path.join("pysam", "config.py"), "w") as outf:
-    outf.write('HTSLIB = "{}"\n'.format(HTSLIB_SOURCE))
+    outf.write(f'HTSLIB = "{HTSLIB_SOURCE}"\n')
     config_values = collections.defaultdict(int)
 
     if HTSLIB_SOURCE == "builtin":
@@ -498,8 +529,8 @@ with open(os.path.join("pysam", "config.py"), "w") as outf:
                         "HAVE_LIBDEFLATE",
                         "HAVE_LIBLZMA",
                         "HAVE_MMAP"]:
-                outf.write("{} = {}\n".format(key, config_values[key]))
-                print("# pysam: config_option: {}={}".format(key, config_values[key]))
+                outf.write(f"{key} = {config_values[key]}\n")
+                print(f"# pysam: config_option: {key}={config_values[key]}")
 
 # create empty config.h files if they have not been created automatically
 # or created by the user:
@@ -532,16 +563,21 @@ else:
 
 define_macros = []
 
+if os.environ.get("CIBUILDWHEEL", "0") == "1":
+    define_macros.append(("BUILDING_WHEEL", None))
+
 suffix = sysconfig.get_config_var('EXT_SUFFIX')
 
 internal_htslib_libraries = [
-    os.path.splitext("chtslib{}".format(suffix))[0]]
+    os.path.splitext(f"chtslib{suffix}")[0],
+    ]
 internal_samtools_libraries = [
-    os.path.splitext("csamtools{}".format(suffix))[0],
-    os.path.splitext("cbcftools{}".format(suffix))[0],
+    os.path.splitext(f"csamtools{suffix}")[0],
+    os.path.splitext(f"cbcftools{suffix}")[0],
     ]
 internal_pysamutil_libraries = [
-    os.path.splitext("cutils{}".format(suffix))[0]]
+    os.path.splitext(f"cutils{suffix}")[0],
+    ]
 
 libraries_for_pysam_module = external_htslib_libraries + internal_htslib_libraries + internal_pysamutil_libraries
 
@@ -567,7 +603,8 @@ def prebuild_libchtslib(ext, force):
             # TODO Eventually by running configure here, we can set these
             # extra flags for configure instead of hacking on ALL_CPPFLAGS.
             args = " ".join(ext.extra_compile_args)
-            run_make(["ALL_CPPFLAGS=-I. " + args + " $(CPPFLAGS)", "lib-static"])
+            defines = " ".join([format_macro_option(*pair) for pair in ext.define_macros])
+            run_make(["ALL_CPPFLAGS=-I. " + args + " " + defines + " $(CPPFLAGS)", "lib-static"])
     else:
         log.warning("skipping 'libhts.a' (already built)")
 
@@ -593,7 +630,7 @@ modules = [
          extra_objects=separate_htslib_objects,
          libraries=external_htslib_libraries + internal_htslib_libraries),
     dict(name="pysam.libcutils",
-         sources=[source_pattern % "utils", "pysam/pysam_util.c"] + os_c_files,
+         sources=[source_pattern % "utils"] + os_c_files,
          extra_objects=separate_htslib_objects,
          libraries=external_htslib_libraries + internal_htslib_libraries + internal_samtools_libraries),
     dict(name="pysam.libcalignmentfile",

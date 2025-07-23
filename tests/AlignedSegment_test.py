@@ -6,6 +6,7 @@ import collections
 import struct
 import copy
 import array
+from pysam import CDEL, CDIFF, CEQUAL, CINS, CMATCH, CPAD, CREF_SKIP, CSOFT_CLIP
 
 from TestUtils import (
     checkFieldEqual,
@@ -48,6 +49,38 @@ class TestAlignedSegment(ReadTest):
     """tests to check if aligned read can be constructed
     and manipulated.
     """
+
+    def check_get_aligned_pairs_combos(self, a, exp):
+        def positions(exp):  return [(ppos, rpos)        for ppos, rpos, base, cigar in exp]
+        def with_seq(exp):   return [(ppos, rpos, base)  for ppos, rpos, base, cigar in exp]
+        def with_cigar(exp): return [(ppos, rpos, cigar) for ppos, rpos, base, cigar in exp]
+
+        self.assertEqual(a.get_aligned_pairs(), positions(exp))
+        self.assertEqual(a.get_aligned_pairs(with_seq=True), with_seq(exp))
+        self.assertEqual(a.get_aligned_pairs(with_cigar=True), with_cigar(exp))
+        self.assertEqual(a.get_aligned_pairs(with_seq=True, with_cigar=True), exp)
+
+        exp = [(ppos, rpos, base, cigar) for ppos, rpos, base, cigar in exp if ppos is not None and rpos is not None]
+
+        self.assertEqual(a.get_aligned_pairs(matches_only=True), positions(exp))
+        self.assertEqual(a.get_aligned_pairs(matches_only=True, with_seq=True), with_seq(exp))
+        self.assertEqual(a.get_aligned_pairs(matches_only=True, with_cigar=True), with_cigar(exp))
+        self.assertEqual(a.get_aligned_pairs(matches_only=True, with_seq=True, with_cigar=True), exp)
+
+    def check_get_aligned_pairs_combos_without_MD(self, a, exp):
+        def positions(exp): return [(ppos, rpos) for ppos, rpos, cigar in exp]
+
+        self.assertEqual(a.get_aligned_pairs(), positions(exp))
+        with self.assertRaises(ValueError): a.get_aligned_pairs(with_seq=True)
+        self.assertEqual(a.get_aligned_pairs(with_cigar=True), exp)
+        with self.assertRaises(ValueError): a.get_aligned_pairs(with_seq=True, with_cigar=True)
+
+        exp = [(ppos, rpos, cigar) for ppos, rpos, cigar in exp if ppos is not None and rpos is not None]
+
+        self.assertEqual(a.get_aligned_pairs(matches_only=True), positions(exp))
+        with self.assertRaises(ValueError): a.get_aligned_pairs(matches_only=True, with_seq=True)
+        self.assertEqual(a.get_aligned_pairs(matches_only=True, with_cigar=True), exp)
+        with self.assertRaises(ValueError): a.get_aligned_pairs(matches_only=True, with_seq=True, with_cigar=True)
 
     def testEmpty(self):
 
@@ -203,6 +236,42 @@ class TestAlignedSegment(ReadTest):
 
         self.assertEqual(pysam.qualities_to_qualitystring(a.query_qualities), s[5:10])
 
+    def testClearSequence(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        self.assertEqual(a.query_sequence, "ATGC")
+        a.query_sequence = None
+        self.assertEqual(a.query_length, 0)
+
+        a.query_sequence = "ATGC"
+        self.assertEqual(a.query_sequence, "ATGC")
+        a.query_sequence = ""
+        self.assertEqual(a.query_length, 0)
+
+        a.query_sequence = "ATGC"
+        self.assertEqual(a.query_sequence, "ATGC")
+        a.query_sequence = "*"
+        self.assertEqual(a.query_length, 0)
+
+    def testUpdateSequenceEffects1(self):
+        a = self.build_read()
+        a.query_sequence = "ATGCATGC"
+        a.cigarstring = "1S5M2S"
+        self.assertEqual(a.query_alignment_sequence, "TGCAT")
+
+        a.query_sequence = "AATTGGCC"
+        self.assertEqual(a.query_alignment_sequence, "ATTGG")
+
+    def testUpdateSequenceEffects2(self):
+        a = self.build_read()
+        a.query_sequence = "ATGCATGC"
+        a.cigarstring = "1S5M2S"
+        self.assertEqual(a.query_alignment_sequence, "TGCAT")
+
+        a.query_sequence = "*"
+        self.assertIsNone(a.query_sequence)
+        self.assertIsNone(a.query_alignment_sequence)
+
     def testUpdateQual(self):
         """Ensure SEQ and QUAL updates leading to absent QUAL set all bytes to 0xff"""
 
@@ -239,6 +308,80 @@ class TestAlignedSegment(ReadTest):
                     qual = data[l_read_name + 4*n_cigar_op + ((l_seq+1) // 2):]
 
                     self.assertEqual(qual, b'\xff' * l_seq)
+
+    def testClearQual(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities = pysam.qualitystring_to_array("qrst")
+        a.query_qualities = None
+        self.assertIsNone(a.query_qualities)
+
+    def testClearQualStr(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities_str = "qrst"
+        self.assertEqual(a.query_qualities, pysam.qualitystring_to_array("qrst"))
+        self.assertEqual(a.query_qualities_str, "qrst")
+
+        a.query_qualities_str = None
+        self.assertIsNone(a.query_qualities)
+        self.assertIsNone(a.query_qualities_str)
+
+        a.query_qualities_str = "qrst"
+        a.query_qualities_str = ""
+        self.assertIsNone(a.query_qualities)
+        self.assertIsNone(a.query_qualities_str)
+
+        a.query_qualities_str = "qrst"
+        a.query_qualities_str = "*"
+        self.assertIsNone(a.query_qualities)
+        self.assertIsNone(a.query_qualities_str)
+
+    def testUpdateQualArrayB(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities = array.array('B', [80, 81, 82, 83])
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
+
+    def testUpdateQualArrayI(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities = array.array('I', [80, 81, 82, 83])
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
+
+    def testUpdateQualList(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        qual = [80, 81, 82, 83]
+        a.query_qualities = qual
+        qual.pop()
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
+
+    def testUpdateQualString(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities = "qrst"
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
+        self.assertEqual(a.qual, "qrst")
+
+    def testUpdateQualString2(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities_str = "qrst"
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
+        self.assertEqual(a.qual, "qrst")
+
+    def testUpdateQualTuple(self):
+        a = pysam.AlignedSegment()
+        a.query_sequence = "ATGC"
+        a.query_qualities = (80, 81, 82, 83)
+        self.assertEqual(len(a.query_qualities), 4)
+        self.assertEqual(a.query_qualities_str, "qrst")
 
     def testLargeRead(self):
         """build an example read."""
@@ -313,50 +456,50 @@ class TestAlignedSegment(ReadTest):
             ],
         )
 
-        self.assertEqual(
-            a.get_aligned_pairs(),
+        self.check_get_aligned_pairs_combos_without_MD(
+            a,
             [
-                (0, 20),
-                (1, 21),
-                (2, 22),
-                (3, 23),
-                (4, 24),
-                (5, 25),
-                (6, 26),
-                (7, 27),
-                (8, 28),
-                (9, 29),
-                (None, 30),
-                (10, 31),
-                (11, 32),
-                (12, 33),
-                (13, 34),
-                (14, 35),
-                (15, 36),
-                (16, 37),
-                (17, 38),
-                (18, 39),
-                (19, None),
-                (20, 40),
-                (21, 41),
-                (22, 42),
-                (23, 43),
-                (24, 44),
-                (25, 45),
-                (26, 46),
-                (27, 47),
-                (28, 48),
-                (29, 49),
-                (30, 50),
-                (31, 51),
-                (32, 52),
-                (33, 53),
-                (34, 54),
-                (35, 55),
-                (36, 56),
-                (37, 57),
-                (38, 58),
-                (39, 59),
+                (0, 20, CMATCH),
+                (1, 21, CMATCH),
+                (2, 22, CMATCH),
+                (3, 23, CMATCH),
+                (4, 24, CMATCH),
+                (5, 25, CMATCH),
+                (6, 26, CMATCH),
+                (7, 27, CMATCH),
+                (8, 28, CMATCH),
+                (9, 29, CMATCH),
+                (None, 30, CDEL),
+                (10, 31, CMATCH),
+                (11, 32, CMATCH),
+                (12, 33, CMATCH),
+                (13, 34, CMATCH),
+                (14, 35, CMATCH),
+                (15, 36, CMATCH),
+                (16, 37, CMATCH),
+                (17, 38, CMATCH),
+                (18, 39, CMATCH),
+                (19, None, CINS),
+                (20, 40, CMATCH),
+                (21, 41, CMATCH),
+                (22, 42, CMATCH),
+                (23, 43, CMATCH),
+                (24, 44, CMATCH),
+                (25, 45, CMATCH),
+                (26, 46, CMATCH),
+                (27, 47, CMATCH),
+                (28, 48, CMATCH),
+                (29, 49, CMATCH),
+                (30, 50, CMATCH),
+                (31, 51, CMATCH),
+                (32, 52, CMATCH),
+                (33, 53, CMATCH),
+                (34, 54, CMATCH),
+                (35, 55, CMATCH),
+                (36, 56, CMATCH),
+                (37, 57, CMATCH),
+                (38, 58, CMATCH),
+                (39, 59, CMATCH),
             ],
         )
 
@@ -435,40 +578,24 @@ class TestAlignedSegment(ReadTest):
     def test_get_aligned_pairs_soft_clipping(self):
         a = self.build_read()
         a.cigartuples = ((4, 2), (0, 35), (4, 3))
-        self.assertEqual(
-            a.get_aligned_pairs(),
-            [(0, None), (1, None)]
+        self.check_get_aligned_pairs_combos_without_MD(
+            a,
+            [(0, None, CSOFT_CLIP), (1, None, CSOFT_CLIP)]
             + [
-                (qpos, refpos)
+                (qpos, refpos, CMATCH)
                 for (qpos, refpos) in zip(range(2, 2 + 35), range(20, 20 + 35))
             ]
-            + [(37, None), (38, None), (39, None)],
-        )
-        self.assertEqual(
-            a.get_aligned_pairs(True),
-            # [(0, None), (1, None)] +
-            [
-                (qpos, refpos)
-                for (qpos, refpos) in zip(range(2, 2 + 35), range(20, 20 + 35))
-            ]
-            # [(37, None), (38, None), (39, None)]
+            + [(37, None, CSOFT_CLIP), (38, None, CSOFT_CLIP), (39, None, CSOFT_CLIP)],
         )
 
     def test_get_aligned_pairs_hard_clipping(self):
         a = self.build_read()
         a.cigartuples = ((5, 2), (0, 35), (5, 3))
-        self.assertEqual(
-            a.get_aligned_pairs(),
+        self.check_get_aligned_pairs_combos_without_MD(
+            a,
             # No seq, no seq pos
             [
-                (qpos, refpos)
-                for (qpos, refpos) in zip(range(0, 0 + 35), range(20, 20 + 35))
-            ],
-        )
-        self.assertEqual(
-            a.get_aligned_pairs(True),
-            [
-                (qpos, refpos)
+                (qpos, refpos, CMATCH)
                 for (qpos, refpos) in zip(range(0, 0 + 35), range(20, 20 + 35))
             ],
         )
@@ -476,23 +603,12 @@ class TestAlignedSegment(ReadTest):
     def test_get_aligned_pairs_skip(self):
         a = self.build_read()
         a.cigarstring = "2M100D38M"
-        self.assertEqual(
-            a.get_aligned_pairs(),
-            [(0, 20), (1, 21)]
-            + [(None, refpos) for refpos in range(22, 22 + 100)]
+        self.check_get_aligned_pairs_combos_without_MD(
+            a,
+            [(0, 20, CMATCH), (1, 21, CMATCH)]
+            + [(None, refpos, CDEL) for refpos in range(22, 22 + 100)]
             + [
-                (qpos, refpos)
-                for (qpos, refpos) in zip(
-                    range(2, 2 + 38), range(20 + 2 + 100, 20 + 2 + 100 + 38)
-                )
-            ],
-        )
-        self.assertEqual(
-            a.get_aligned_pairs(True),
-            [(0, 20), (1, 21)] +
-            # [(None, refpos) for refpos in range(21, 21+100)] +
-            [
-                (qpos, refpos)
+                (qpos, refpos, CMATCH)
                 for (qpos, refpos) in zip(
                     range(2, 2 + 38), range(20 + 2 + 100, 20 + 2 + 100 + 38)
                 )
@@ -502,17 +618,10 @@ class TestAlignedSegment(ReadTest):
     def test_get_aligned_pairs_match_mismatch(self):
         a = self.build_read()
         a.cigartuples = ((7, 20), (8, 20))
-        self.assertEqual(
-            a.get_aligned_pairs(),
+        self.check_get_aligned_pairs_combos_without_MD(
+            a,
             [
-                (qpos, refpos)
-                for (qpos, refpos) in zip(range(0, 0 + 40), range(20, 20 + 40))
-            ],
-        )
-        self.assertEqual(
-            a.get_aligned_pairs(True),
-            [
-                (qpos, refpos)
+                (qpos, refpos, CEQUAL if qpos < 20 else CDIFF)
                 for (qpos, refpos) in zip(range(0, 0 + 40), range(20, 20 + 40))
             ],
         )
@@ -522,8 +631,16 @@ class TestAlignedSegment(ReadTest):
         a.cigartuples = ((0, 1), (6, 1), (0, 1))
         # The padding operation is like an insertion into the reference.
         # See comment in test_get_aligned_pairs_padding_with_seq (below).
-        self.assertEqual(a.get_aligned_pairs(),
-                         [(0, 20), (1, None), (2, 21)])
+        self.check_get_aligned_pairs_combos_without_MD(a,
+                         [(0, 20, CMATCH), (1, None, CPAD), (2, 21, CMATCH)])
+
+    def test_get_aligned_pairs_padding_via_cigarstring(self):
+        a = self.build_read()
+        a.cigarstring = "1M1P1M"
+        # The padding operation is like an insertion into the reference.
+        # See comment in test_get_aligned_pairs_padding_with_seq (below).
+        self.check_get_aligned_pairs_combos_without_MD(a,
+                         [(0, 20, CMATCH), (1, None, CPAD), (2, 21, CMATCH)])
 
     def test_get_aligned_pairs_padding_with_seq(self):
         a = self.build_read()
@@ -550,80 +667,80 @@ class TestAlignedSegment(ReadTest):
         # string: "Alternatively, to describe the same alignments, we can
         # modify the reference sequence to contain pads that make room for
         # sequences inserted relative to the reference."
-        self.assertEqual(a.get_aligned_pairs(with_seq=True),
-                         [(0, 20, 'A'), (1, None, None), (2, 21, 'T')])
+        self.check_get_aligned_pairs_combos(a,
+            [(0, 20, "A", CMATCH), (1, None, None, CPAD), (2, 21, "T", CMATCH)])
 
     def test_get_aligned_pairs(self):
         a = self.build_read()
         a.query_sequence = "A" * 9
         a.cigarstring = "9M"
         a.set_tag("MD", "9")
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=True),
+        self.check_get_aligned_pairs_combos(
+            a,
             [
-                (0, 20, "A"),
-                (1, 21, "A"),
-                (2, 22, "A"),
-                (3, 23, "A"),
-                (4, 24, "A"),
-                (5, 25, "A"),
-                (6, 26, "A"),
-                (7, 27, "A"),
-                (8, 28, "A"),
+                (0, 20, "A", CMATCH),
+                (1, 21, "A", CMATCH),
+                (2, 22, "A", CMATCH),
+                (3, 23, "A", CMATCH),
+                (4, 24, "A", CMATCH),
+                (5, 25, "A", CMATCH),
+                (6, 26, "A", CMATCH),
+                (7, 27, "A", CMATCH),
+                (8, 28, "A", CMATCH),
             ],
         )
 
         a.set_tag("MD", "4C4")
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=True),
+        self.check_get_aligned_pairs_combos(
+            a,
             [
-                (0, 20, "A"),
-                (1, 21, "A"),
-                (2, 22, "A"),
-                (3, 23, "A"),
-                (4, 24, "c"),
-                (5, 25, "A"),
-                (6, 26, "A"),
-                (7, 27, "A"),
-                (8, 28, "A"),
+                (0, 20, "A", CMATCH),
+                (1, 21, "A", CMATCH),
+                (2, 22, "A", CMATCH),
+                (3, 23, "A", CMATCH),
+                (4, 24, "c", CMATCH),
+                (5, 25, "A", CMATCH),
+                (6, 26, "A", CMATCH),
+                (7, 27, "A", CMATCH),
+                (8, 28, "A", CMATCH),
             ],
         )
 
         a.cigarstring = "5M2D4M"
         a.set_tag("MD", "4C^TT4")
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=True),
+        self.check_get_aligned_pairs_combos(
+            a,
             [
-                (0, 20, "A"),
-                (1, 21, "A"),
-                (2, 22, "A"),
-                (3, 23, "A"),
-                (4, 24, "c"),
-                (None, 25, "T"),
-                (None, 26, "T"),
-                (5, 27, "A"),
-                (6, 28, "A"),
-                (7, 29, "A"),
-                (8, 30, "A"),
+                (0, 20, "A", CMATCH),
+                (1, 21, "A", CMATCH),
+                (2, 22, "A", CMATCH),
+                (3, 23, "A", CMATCH),
+                (4, 24, "c", CMATCH),
+                (None, 25, "T", CDEL),
+                (None, 26, "T", CDEL),
+                (5, 27, "A", CMATCH),
+                (6, 28, "A", CMATCH),
+                (7, 29, "A", CMATCH),
+                (8, 30, "A", CMATCH),
             ],
         )
 
         a.cigarstring = "5M2D2I2M"
         a.set_tag("MD", "4C^TT2")
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=True),
+        self.check_get_aligned_pairs_combos(
+            a,
             [
-                (0, 20, "A"),
-                (1, 21, "A"),
-                (2, 22, "A"),
-                (3, 23, "A"),
-                (4, 24, "c"),
-                (None, 25, "T"),
-                (None, 26, "T"),
-                (5, None, None),
-                (6, None, None),
-                (7, 27, "A"),
-                (8, 28, "A"),
+                (0, 20, "A", CMATCH),
+                (1, 21, "A", CMATCH),
+                (2, 22, "A", CMATCH),
+                (3, 23, "A", CMATCH),
+                (4, 24, "c", CMATCH),
+                (None, 25, "T", CDEL),
+                (None, 26, "T", CDEL),
+                (5, None, None, CINS),
+                (6, None, None, CINS),
+                (7, 27, "A", CMATCH),
+                (8, 28, "A", CMATCH),
             ],
         )
 
@@ -643,54 +760,21 @@ class TestAlignedSegment(ReadTest):
         a.cigarstring = "5M1N5M"
         a.set_tag("MD", "10")
 
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=True),
+        self.check_get_aligned_pairs_combos(
+            a,
             [
-                (0, 20, "A"),
-                (1, 21, "A"),
-                (2, 22, "A"),
-                (3, 23, "A"),
-                (4, 24, "A"),
-                (None, 25, None),
-                (5, 26, "A"),
-                (6, 27, "A"),
-                (7, 28, "A"),
-                (8, 29, "A"),
-                (9, 30, "A"),
-            ],
-        )
-
-        self.assertEqual(
-            a.get_aligned_pairs(with_seq=False),
-            [
-                (0, 20),
-                (1, 21),
-                (2, 22),
-                (3, 23),
-                (4, 24),
-                (None, 25),
-                (5, 26),
-                (6, 27),
-                (7, 28),
-                (8, 29),
-                (9, 30),
-            ],
-        )
-
-        self.assertEqual(
-            a.get_aligned_pairs(matches_only=True, with_seq=False),
-            [
-                (0, 20),
-                (1, 21),
-                (2, 22),
-                (3, 23),
-                (4, 24),
-                (5, 26),
-                (6, 27),
-                (7, 28),
-                (8, 29),
-                (9, 30),
-            ],
+                (0, 20, "A", CMATCH),
+                (1, 21, "A", CMATCH),
+                (2, 22, "A", CMATCH),
+                (3, 23, "A", CMATCH),
+                (4, 24, "A", CMATCH),
+                (None, 25, None, CREF_SKIP),
+                (5, 26, "A", CMATCH),
+                (6, 27, "A", CMATCH),
+                (7, 28, "A", CMATCH),
+                (8, 29, "A", CMATCH),
+                (9, 30, "A", CMATCH),
+            ]
         )
 
     def test_equivalence_matches_only_and_with_seq(self):
@@ -698,32 +782,22 @@ class TestAlignedSegment(ReadTest):
         a.query_sequence = "ACGT" * 2
         a.cigarstring = "4M1D4M"
         a.set_tag("MD", "4^x4")
-        full = (
-            list(zip(range(0, 4), range(20, 24), "ACGT"))
-            + [(None, 24, "x")]
-            + list(zip(range(4, 8), range(25, 29), "ACGT"))
-        )
-        self.assertEqual(a.get_aligned_pairs(matches_only=False, with_seq=True), full)
-
-        self.assertEqual(
-            a.get_aligned_pairs(matches_only=True, with_seq=True),
-            [x for x in full if x[0] is not None and x[1] is not None],
+        self.check_get_aligned_pairs_combos(
+            a,
+            list(zip(range(0, 4), range(20, 24), "ACGT", [CMATCH] * 4))
+            + [(None, 24, "x", CDEL)]
+            + list(zip(range(4, 8), range(25, 29), "ACGT", [CMATCH] * 4)),
         )
 
         a = self.build_read()
         a.query_sequence = "ACGT" * 2
         a.cigarstring = "4M1N4M"
         a.set_tag("MD", "8")
-        full = (
-            list(zip(range(0, 4), range(20, 24), "ACGT"))
-            + [(None, 24, None)]
-            + list(zip(range(4, 8), range(25, 29), "ACGT"))
-        )
-        self.assertEqual(a.get_aligned_pairs(matches_only=False, with_seq=True), full)
-
-        self.assertEqual(
-            a.get_aligned_pairs(matches_only=True, with_seq=True),
-            [x for x in full if x[0] is not None and x[1] is not None],
+        self.check_get_aligned_pairs_combos(
+            a,
+            list(zip(range(0, 4), range(20, 24), "ACGT", [CMATCH] * 4))
+            + [(None, 24, None, 3)]
+            + list(zip(range(4, 8), range(25, 29), "ACGT", [CMATCH] * 4)),
         )
 
     def test_get_aligned_pairs_lowercase_md(self):
@@ -991,6 +1065,16 @@ class TestCigar(ReadTest):
         r.cigarstring = None
         self.assertEqual(r.cigarstring, None)
 
+        r.cigarstring = "40M"
+        self.assertEqual(r.cigartuples, [(0, 40)])
+        r.cigarstring = ""
+        self.assertEqual(r.cigarstring, None)
+
+        r.cigarstring = "40M"
+        self.assertEqual(r.cigartuples, [(0, 40)])
+        r.cigarstring = "*"
+        self.assertEqual(r.cigarstring, None)
+
     def testCigar(self):
         r = self.build_read()
         self.assertEqual(r.cigartuples, [(0, 10), (2, 1), (0, 9), (1, 1), (0, 20)])
@@ -1027,6 +1111,16 @@ class TestCigarStats(ReadTest):
             expected[0][i] = 2
             expected[1][i] = 1
             self.assertEqual([list(x) for x in a.get_cigar_stats()], expected)
+
+        for i in range(1, 100):
+            cigarstring = "".join("10{}".format(x)
+                                  for x in iter("MIDNSHP=X")) * i
+            a.cigarstring = cigarstring
+            self.assertEqual(a.cigarstring, cigarstring)
+            expected = [[i * 10 for j in range(len("MIDNSHP=X"))] + [0, 0],
+                        [i for j in range(len("MIDNSHP=X"))] + [0, 0]]
+            obtained = [list(x) for x in a.get_cigar_stats()]
+            self.assertEqual(obtained, expected)
 
         a.cigarstring = "10M"
         a.set_tag("NM", 5)

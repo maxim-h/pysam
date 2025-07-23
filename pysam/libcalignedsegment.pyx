@@ -65,7 +65,6 @@ cimport cython
 from cpython cimport array as c_array
 from cpython cimport PyBytes_FromStringAndSize
 from libc.string cimport memset, strchr
-from cpython cimport array as c_array
 from libc.stdint cimport INT8_MIN, INT16_MIN, INT32_MIN, \
     INT8_MAX, INT16_MAX, INT32_MAX, \
     UINT8_MAX, UINT16_MAX, UINT32_MAX
@@ -73,8 +72,6 @@ from libc.stdint cimport INT8_MIN, INT16_MIN, INT32_MIN, \
 from pysam.libchtslib cimport HTS_IDX_NOCOOR
 from pysam.libcutils cimport force_bytes, force_str, \
     charptr_to_str, charptr_to_bytes
-from pysam.libcutils cimport qualities_to_qualitystring, qualitystring_to_array, \
-    array_to_qualitystring
 
 # Constants for binary tag conversion
 cdef char * htslib_types = 'cCsSiIf'
@@ -556,28 +553,6 @@ cdef inline bytes getSequenceInRange(bam1_t *src,
     return charptr_to_bytes(seq)
 
 
-cdef inline object getQualitiesInRange(bam1_t *src,
-                                       uint32_t start,
-                                       uint32_t end):
-    """return python array of quality values from a bam1_t object"""
-
-    cdef uint8_t * p
-    cdef uint32_t k
-
-    p = pysam_bam_get_qual(src)
-    if p[0] == 0xff:
-        return None
-
-    # 'B': unsigned char
-    cdef c_array.array result = array.array('B', [0])
-    c_array.resize(result, end - start)
-
-    # copy data
-    memcpy(result.data.as_voidptr, <void*>&p[start], end - start)
-
-    return result
-
-
 #####################################################################
 ## factory methods for instantiating extension classes
 cdef class AlignedSegment
@@ -588,6 +563,7 @@ cdef AlignedSegment makeAlignedSegment(bam1_t *src,
     cdef AlignedSegment dest = AlignedSegment.__new__(AlignedSegment)
     dest._delegate = bam_dup1(src)
     dest.header = header
+    dest.cache = _AlignedSegment_Cache()
     return dest
 
 
@@ -894,6 +870,48 @@ cdef inline bytes build_reference_sequence(bam1_t * src):
     return seq
 
 
+cdef inline str safe_reference_name(AlignmentHeader header, int tid):
+    if tid == -1: return "*"
+    elif header is not None: return header.get_reference_name(tid)
+    else: return f"#{tid}"
+
+
+# Tuple-building helper functions used by AlignedSegment.get_aligned_pairs()
+
+cdef _alignedpairs_positions(qpos, pos, ref_seq, uint32_t r_idx, int op):
+    return (qpos, pos)
+
+
+cdef _alignedpairs_with_seq(qpos, pos, ref_seq, uint32_t r_idx, int op):
+    ref_base = ref_seq[r_idx] if ref_seq is not None else None
+    return (qpos, pos, ref_base)
+
+
+cdef _alignedpairs_with_cigar(qpos, pos, ref_seq, uint32_t r_idx, int op):
+    return (qpos, pos, CIGAR_OPS(op))
+
+
+cdef _alignedpairs_with_seq_cigar(qpos, pos, ref_seq, uint32_t r_idx, int op):
+    ref_base = ref_seq[r_idx] if ref_seq is not None else None
+    return (qpos, pos, ref_base, CIGAR_OPS(op))
+
+
+cdef class _AlignedSegment_Cache:
+    def __cinit__(self):
+        self.clear_query_sequences()
+        self.clear_query_qualities()
+
+    cdef clear_query_sequences(self):
+        self.query_sequence = NotImplemented
+        self.query_alignment_sequence = NotImplemented
+
+    cdef clear_query_qualities(self):
+        self.query_qualities = NotImplemented
+        self.query_qualities_str = NotImplemented
+        self.query_alignment_qualities = NotImplemented
+        self.query_alignment_qualities_str = NotImplemented
+
+
 cdef class AlignedSegment:
     '''Class representing an aligned segment.
 
@@ -945,10 +963,7 @@ cdef class AlignedSegment:
         self._delegate.core.mpos = -1
 
         # caching for selected fields
-        self.cache_query_qualities = None
-        self.cache_query_alignment_qualities = None
-        self.cache_query_sequence = None
-        self.cache_query_alignment_sequence = None
+        self.cache = _AlignedSegment_Cache()
 
         self.header = header
 
@@ -960,7 +975,8 @@ cdef class AlignedSegment:
 
         The representation is an approximate :term:`SAM` format, because
         an aligned read might not be associated with a :term:`AlignmentFile`.
-        As a result :term:`tid` is shown instead of the reference name.
+        Hence when the read does not have an associated :class:`AlignedHeader`,
+        :term:`tid` is shown instead of the reference name.
         Similarly, the tags field is returned in its parsed state.
 
         To get a valid SAM record, use :meth:`to_string`.
@@ -969,11 +985,11 @@ cdef class AlignedSegment:
         # requires a valid header.
         return "\t".join(map(str, (self.query_name,
                                    self.flag,
-                                   "#%d" % self.reference_id if self.reference_id >= 0 else "*",
+                                   safe_reference_name(self.header, self.reference_id),
                                    self.reference_start + 1,
                                    self.mapping_quality,
                                    self.cigarstring,
-                                   "#%d" % self.next_reference_id if self.next_reference_id >= 0 else "*",
+                                   safe_reference_name(self.header, self.next_reference_id),
                                    self.next_reference_start + 1,
                                    self.template_length,
                                    self.query_sequence,
@@ -981,7 +997,8 @@ cdef class AlignedSegment:
                                    self.tags)))
 
     def __repr__(self):
-        return f'<{type(self).__name__}({self.query_name!r}, flags={self.flag}={self.flag:#x}, ref={self.reference_name!r}, zpos={self.reference_start}, mapq={self.mapping_quality}, cigar={self.cigarstring!r}, ...)>'
+        ref = self.reference_name if self.header is not None else self.reference_id
+        return f'<{type(self).__name__}({self.query_name!r}, flags={self.flag}={self.flag:#x}, ref={ref!r}, zpos={self.reference_start}, mapq={self.mapping_quality}, cigar={self.cigarstring!r}, ...)>'
 
     def __copy__(self):
         return makeAlignedSegment(self._delegate, self.header)
@@ -1094,6 +1111,7 @@ cdef class AlignedSegment:
         cdef AlignedSegment dest = cls.__new__(cls)
         dest._delegate = <bam1_t*>calloc(1, sizeof(bam1_t))
         dest.header = header
+        dest.cache = _AlignedSegment_Cache()
 
         cdef kstring_t line
         line.l = line.m = len(sam)
@@ -1285,15 +1303,30 @@ cdef class AlignedSegment:
         empty string.
         '''
         def __get__(self):
-            c = self.cigartuples
-            if c is None:
+            cdef bam1_t *src = self._delegate
+            if pysam_get_n_cigar(src) == 0:
                 return None
-            # reverse order
-            else:
-                return "".join([ "%i%c" % (y,CODE2CIGAR[x]) for x,y in c])
+
+            cdef kstring_t buf
+            buf.l = buf.m = 0
+            buf.s = NULL
+
+            cdef uint32_t *cigar_p = pysam_bam_get_cigar(src)
+            cdef uint32_t op, l
+            cdef int k
+            for k from 0 <= k < pysam_get_n_cigar(src):
+                op = cigar_p[k] & BAM_CIGAR_MASK
+                l = cigar_p[k] >> BAM_CIGAR_SHIFT
+                kputl(l, &buf)
+                kputc(CODE2CIGAR[op], &buf)
+
+            try:
+                return buf.s[:buf.l].decode("ascii")
+            finally:
+                free(buf.s)
 
         def __set__(self, cigar):
-            if cigar is None or len(cigar) == 0:
+            if cigar is None or len(cigar) == 0 or cigar == "*":
                 self.cigartuples = []
             else:
                 parts = CIGAR_REGEX.findall(cigar)
@@ -1392,19 +1425,20 @@ cdef class AlignedSegment:
         has aligned the read to the reverse strand.)
         """
         def __get__(self):
-            if self.cache_query_sequence:
-                return self.cache_query_sequence
+            if self.cache.query_sequence is not NotImplemented:
+                return self.cache.query_sequence
 
             cdef bam1_t * src
             cdef char * s
             src = self._delegate
 
             if src.core.l_qseq == 0:
+                self.cache.query_sequence = None
                 return None
 
-            self.cache_query_sequence = force_str(getSequenceInRange(
+            self.cache.query_sequence = force_str(getSequenceInRange(
                 src, 0, src.core.l_qseq))
-            return self.cache_query_sequence
+            return self.cache.query_sequence
 
         def __set__(self, seq):
             # samtools manages sequence and quality length memory together
@@ -1415,7 +1449,7 @@ cdef class AlignedSegment:
             cdef int l, k
             cdef Py_ssize_t nbytes_new, nbytes_old
 
-            if seq == None:
+            if seq is None or len(seq) == 0 or seq == "*":
                 l = 0
             else:
                 l = len(seq)
@@ -1456,11 +1490,8 @@ cdef class AlignedSegment:
                 p = pysam_bam_get_qual(src)
                 memset(p, 0xff, l)
 
-            self.cache_query_sequence = force_str(seq)
-
-            # clear cached values for quality values
-            self.cache_query_qualities = None
-            self.cache_query_alignment_qualities = None
+            self.cache.clear_query_sequences()
+            self.cache.clear_query_qualities()
 
     property query_qualities:
         """read sequence base qualities, including :term:`soft clipped` bases 
@@ -1473,62 +1504,113 @@ cdef class AlignedSegment:
 
         Note that to set quality scores the sequence has to be set
         beforehand as this will determine the expected length of the
-        quality score array.
+        quality score array. Setting will raise a ValueError if the
+        length of the new quality scores is not the same as the
+        length of the existing sequence.
 
-        This method raises a ValueError if the length of the
-        quality scores and the sequence are not the same.
-
+        Quality scores to be set may be specified as a Python array
+        or other iterable of ints, or as a string of ASCII-encooded
+        FASTQ/SAM-style base quality characters.
         """
         def __get__(self):
+            if self.cache.query_qualities is not NotImplemented:
+                return self.cache.query_qualities
 
-            if self.cache_query_qualities:
-                return self.cache_query_qualities
+            cdef bam1_t *src = self._delegate
+            cdef int qual_len = src.core.l_qseq
+            cdef uint8_t *qual = pysam_bam_get_qual(src)
 
-            cdef bam1_t * src
-            cdef char * q
-
-            src = self._delegate
-
-            if src.core.l_qseq == 0:
+            if qual_len == 0 or qual[0] == 0xff:
+                self.cache.query_qualities = None
                 return None
 
-            self.cache_query_qualities = getQualitiesInRange(src, 0, src.core.l_qseq)
-            return self.cache_query_qualities
+            cdef c_array.array qual_array = array.array('B')
+            c_array.resize(qual_array, qual_len)
+            memcpy(qual_array.data.as_uchars, qual, qual_len)
+            self.cache.query_qualities = qual_array
+            return qual_array
 
-        def __set__(self, qual):
-
-            # note that memory is already allocated via setting the sequence
-            # hence length match of sequence and quality needs is checked.
-            cdef bam1_t * src
-            cdef uint8_t * p
-            cdef int l
-
-            src = self._delegate
-            p = pysam_bam_get_qual(src)
-            if qual is None or len(qual) == 0:
-                # if absent and there is a sequence: set to 0xff
-                memset(p, 0xff, src.core.l_qseq)
+        def __set__(self, new_qual):
+            if isinstance(new_qual, str):
+                self.query_qualities_str = new_qual
                 return
 
-            # check for length match
-            l = len(qual)
-            if src.core.l_qseq != l:
-                raise ValueError(
-                    "quality and sequence mismatch: %i != %i" %
-                    (l, src.core.l_qseq))
+            cdef bam1_t *src = self._delegate
+            cdef int qual_len = src.core.l_qseq
+            cdef uint8_t *qual = pysam_bam_get_qual(src)
 
-            # create a python array object filling it
-            # with the quality scores
+            cdef int new_qual_len = len(new_qual) if new_qual is not None else 0
+            if new_qual_len == 0:
+                if qual_len != 0: memset(qual, 0xff, qual_len)
+                self.cache.clear_query_qualities()
+                return
 
-            # NB: should avoid this copying if qual is
-            # already of the correct type.
-            cdef c_array.array result = c_array.array('B', qual)
+            if new_qual_len != qual_len:
+                raise ValueError(f"quality ({new_qual_len}) and sequence ({qual_len}) length mismatch")
 
-            # copy data
-            memcpy(p, result.data.as_voidptr, l)
+            if isinstance(new_qual, array.array) and new_qual.typecode == 'B':
+                memcpy(qual, (<c_array.array> new_qual).data.as_uchars, qual_len)
+                self.cache.clear_query_qualities()
+                return
 
-            # save in cache
-            self.cache_query_qualities = qual
+            cdef uint8_t *s = qual
+            cdef uint8_t q
+            for q in new_qual:
+                s[0] = q
+                s += 1
+
+            self.cache.clear_query_qualities()
+
+    property query_qualities_str:
+        """read sequence base qualities, including :term:`soft clipped` bases,
+        returned as an ASCII-encoded string similar to that in FASTQ or SAM files,
+        or None if base qualities are not present.
+
+        Note that to set quality scores the sequence has to be set beforehand
+        as this will determine the expected length of the quality score string.
+        Setting will raise a ValueError if the length of the new quality scores
+        is not the same as the length of the existing sequence.
+        """
+        def __get__(self):
+            if self.cache.query_qualities_str is not NotImplemented:
+                return self.cache.query_qualities_str
+
+            cdef bam1_t *src = self._delegate
+            cdef int qual_len = src.core.l_qseq
+            cdef uint8_t *qual = pysam_bam_get_qual(src)
+
+            if qual_len == 0 or qual[0] == 0xff:
+                self.cache.query_qualities_str = None
+                return None
+
+            cdef bytes qual_bytes = qual[:qual_len]
+            cdef char *s = qual_bytes
+            cdef int i
+            for i in range(qual_len): s[i] += 33
+
+            self.cache.query_qualities_str = qual_bytes.decode('ascii')
+            return self.cache.query_qualities_str
+
+        def __set__(self, new_qual):
+            cdef bam1_t *src = self._delegate
+            cdef int qual_len = src.core.l_qseq
+            cdef uint8_t *qual = pysam_bam_get_qual(src)
+
+            cdef int new_qual_len = len(new_qual) if new_qual is not None else 0
+            if new_qual_len == 0 or new_qual == "*":
+                if qual_len != 0: memset(qual, 0xff, qual_len)
+                self.cache.clear_query_qualities()
+                return
+
+            if new_qual_len != qual_len:
+                raise ValueError(f"quality ({new_qual_len}) and sequence ({qual_len}) length mismatch")
+
+            cdef bytes new_qual_bytes = new_qual.encode('ascii')
+            cdef const char *s = new_qual_bytes
+            cdef int i
+            for i in range(qual_len): qual[i] = s[i] - 33
+
+            self.cache.clear_query_qualities()
 
     property bin:
         """properties bin"""
@@ -1707,8 +1789,8 @@ cdef class AlignedSegment:
         """
 
         def __get__(self):
-            if self.cache_query_alignment_sequence:
-                return self.cache_query_alignment_sequence
+            if self.cache.query_alignment_sequence is not NotImplemented:
+                return self.cache.query_alignment_sequence
 
             cdef bam1_t * src
             cdef uint32_t start, end
@@ -1716,14 +1798,14 @@ cdef class AlignedSegment:
             src = self._delegate
 
             if src.core.l_qseq == 0:
+                self.cache.query_alignment_sequence = None
                 return None
 
             start = getQueryStart(src)
             end   = getQueryEnd(src)
 
-            self.cache_query_alignment_sequence = force_str(
-                getSequenceInRange(src, start, end))
-            return self.cache_query_alignment_sequence
+            self.cache.query_alignment_sequence = force_str(getSequenceInRange(src, start, end))
+            return self.cache.query_alignment_sequence
 
     property query_alignment_qualities:
         """aligned query sequence quality values (None if not present). These
@@ -1738,26 +1820,44 @@ cdef class AlignedSegment:
         needs to be subtracted.
 
         This property is read-only.
-
         """
         def __get__(self):
+            if self.cache.query_alignment_qualities is not NotImplemented:
+                return self.cache.query_alignment_qualities
 
-            if self.cache_query_alignment_qualities:
-                return self.cache_query_alignment_qualities
-
-            cdef bam1_t * src
-            cdef uint32_t start, end
-
-            src = self._delegate
-
-            if src.core.l_qseq == 0:
+            cdef object full_qual = self.query_qualities
+            if full_qual is None:
+                self.cache.query_alignment_qualities = None
                 return None
 
-            start = getQueryStart(src)
-            end   = getQueryEnd(src)
-            self.cache_query_alignment_qualities = \
-                getQualitiesInRange(src, start, end)
-            return self.cache_query_alignment_qualities
+            cdef bam1_t *src = self._delegate
+            cdef uint32_t start = getQueryStart(src)
+            cdef uint32_t end = getQueryEnd(src)
+            self.cache.query_alignment_qualities = full_qual[start:end]
+            return self.cache.query_alignment_qualities
+
+    property query_alignment_qualities_str:
+        """aligned query sequence quality values, returned as an ASCII-encoded string
+        similar to that in FASTQ or SAM files, or None if base qualities are not present.
+        These are the quality values that correspond to :attr:`query_alignment_sequence`,
+        i.e., excluding qualities corresponding to soft-clipped bases.
+
+        This property is read-only.
+        """
+        def __get__(self):
+            if self.cache.query_alignment_qualities_str is not NotImplemented:
+                return self.cache.query_alignment_qualities_str
+
+            cdef object full_qual = self.query_qualities_str
+            if full_qual is None:
+                self.cache.query_alignment_qualities_str = None
+                return None
+
+            cdef bam1_t *src = self._delegate
+            cdef uint32_t start = getQueryStart(src)
+            cdef uint32_t end = getQueryEnd(src)
+            self.cache.query_alignment_qualities_str = full_qual[start:end]
+            return self.cache.query_alignment_qualities_str
 
     property query_alignment_start:
         """start index of the aligned query portion of the sequence (0-based,
@@ -1978,8 +2078,7 @@ cdef class AlignedSegment:
         else:
             return self.query_qualities
 
-
-    def get_aligned_pairs(self, matches_only=False, with_seq=False):
+    def get_aligned_pairs(self, matches_only=False, with_seq=False, with_cigar=False):
         """a list of aligned read (query) and reference positions.
 
         Each item in the returned list is a tuple consisting of
@@ -2003,6 +2102,9 @@ cdef class AlignedSegment:
           reference sequence. For CIGAR 'P' (padding in the reference)
           operations, the third tuple element will be None. Substitutions
           are lower-case. This option requires an MD tag to be present.
+        with_cigar : bool
+          If True, return an extra element in the tuple containing the
+          CIGAR operator corresponding to this position tuple.
 
         Returns
         -------
@@ -2016,6 +2118,8 @@ cdef class AlignedSegment:
         cdef bam1_t * src = self._delegate
         cdef bint _matches_only = bool(matches_only)
         cdef bint _with_seq = bool(with_seq)
+        cdef bint _with_cigar = bool(with_cigar)
+        cdef object (*make_tuple)(object, object, object, uint32_t, int)
 
         # TODO: this method performs no checking and assumes that
         # read sequence, cigar and MD tag are consistent.
@@ -2025,6 +2129,10 @@ cdef class AlignedSegment:
             ref_seq = force_str(build_reference_sequence(src))
             if ref_seq is None:
                 raise ValueError("MD tag not present")
+            make_tuple = _alignedpairs_with_seq_cigar if _with_cigar else _alignedpairs_with_seq
+        else:
+            ref_seq = None
+            make_tuple = _alignedpairs_with_cigar if _with_cigar else _alignedpairs_positions
 
         r_idx = 0
 
@@ -2040,39 +2148,25 @@ cdef class AlignedSegment:
             l = cigar_p[k] >> BAM_CIGAR_SHIFT
 
             if op == BAM_CMATCH or op == BAM_CEQUAL or op == BAM_CDIFF:
-                if _with_seq:
-                    for i from pos <= i < pos + l:
-                        result.append((qpos, i, ref_seq[r_idx]))
-                        r_idx += 1
-                        qpos += 1
-                else:
-                    for i from pos <= i < pos + l:
-                        result.append((qpos, i))
-                        qpos += 1
+                for i from pos <= i < pos + l:
+                    result.append(make_tuple(qpos, i, ref_seq, r_idx, op))
+                    r_idx += 1
+                    qpos += 1
                 pos += l
 
             elif op == BAM_CINS or op == BAM_CSOFT_CLIP or op == BAM_CPAD:
                 if not _matches_only:
-                    if _with_seq:
-                        for i from pos <= i < pos + l:
-                            result.append((qpos, None, None))
-                            qpos += 1
-                    else:
-                        for i from pos <= i < pos + l:
-                            result.append((qpos, None))
-                            qpos += 1
+                    for i from pos <= i < pos + l:
+                        result.append(make_tuple(qpos, None, None, 0, op))
+                        qpos += 1
                 else:
                     qpos += l
 
             elif op == BAM_CDEL:
                 if not _matches_only:
-                    if _with_seq:
-                        for i from pos <= i < pos + l:
-                            result.append((None, i, ref_seq[r_idx]))
-                            r_idx += 1
-                    else:
-                        for i from pos <= i < pos + l:
-                            result.append((None, i))
+                    for i from pos <= i < pos + l:
+                        result.append(make_tuple(None, i, ref_seq, r_idx, op))
+                        r_idx += 1
                 else:
                     r_idx += l
                 pos += l
@@ -2082,12 +2176,8 @@ cdef class AlignedSegment:
 
             elif op == BAM_CREF_SKIP:
                 if not _matches_only:
-                    if _with_seq:
-                        for i from pos <= i < pos + l:
-                            result.append((None, i, None))
-                    else:
-                        for i from pos <= i < pos + l:
-                            result.append((None, i))
+                    for i from pos <= i < pos + l:
+                        result.append(make_tuple(None, i, None, 0, op))
 
                 pos += l
 
@@ -2172,29 +2262,29 @@ cdef class AlignedSegment:
         field will always be 0. (Accessing this field via index -1
         avoids changes if more CIGAR operators are added in future.)
 
-        +-----+----------------+--------+
-        |M    |pysam.CMATCH    |0       |
-        +-----+----------------+--------+
-        |I    |pysam.CINS      |1       |
-        +-----+----------------+--------+
-        |D    |pysam.CDEL      |2       |
-        +-----+----------------+--------+
-        |N    |pysam.CREF_SKIP |3       |
-        +-----+----------------+--------+
-        |S    |pysam.CSOFT_CLIP|4       |
-        +-----+----------------+--------+
-        |H    |pysam.CHARD_CLIP|5       |
-        +-----+----------------+--------+
-        |P    |pysam.CPAD      |6       |
-        +-----+----------------+--------+
-        |=    |pysam.CEQUAL    |7       |
-        +-----+----------------+--------+
-        |X    |pysam.CDIFF     |8       |
-        +-----+----------------+--------+
-        |B    |pysam.CBACK     |9       |
-        +-----+----------------+--------+
-        |NM   |NM tag          |10 or -1|
-        +-----+----------------+--------+
+        +-----+--------------------------+--------+
+        |M    |pysam.CIGAR_OPS.CMATCH    |0       |
+        +-----+--------------------------+--------+
+        |I    |pysam.CIGAR_OPS.CINS      |1       |
+        +-----+--------------------------+--------+
+        |D    |pysam.CIGAR_OPS.CDEL      |2       |
+        +-----+--------------------------+--------+
+        |N    |pysam.CIGAR_OPS.CREF_SKIP |3       |
+        +-----+--------------------------+--------+
+        |S    |pysam.CIGAR_OPS.CSOFT_CLIP|4       |
+        +-----+--------------------------+--------+
+        |H    |pysam.CIGAR_OPS.CHARD_CLIP|5       |
+        +-----+--------------------------+--------+
+        |P    |pysam.CIGAR_OPS.CPAD      |6       |
+        +-----+--------------------------+--------+
+        |=    |pysam.CIGAR_OPS.CEQUAL    |7       |
+        +-----+--------------------------+--------+
+        |X    |pysam.CIGAR_OPS.CDIFF     |8       |
+        +-----+--------------------------+--------+
+        |B    |pysam.CIGAR_OPS.CBACK     |9       |
+        +-----+--------------------------+--------+
+        |NM   |NM tag                    |10 or -1|
+        +-----+--------------------------+--------+
 
         If no cigar string is present, empty arrays will be returned.
 
@@ -2249,27 +2339,27 @@ cdef class AlignedSegment:
 
         The operations are:
 
-        +-----+----------------+-----+
-        |M    |pysam.CMATCH    |0    |
-        +-----+----------------+-----+
-        |I    |pysam.CINS      |1    |
-        +-----+----------------+-----+
-        |D    |pysam.CDEL      |2    |
-        +-----+----------------+-----+
-        |N    |pysam.CREF_SKIP |3    |
-        +-----+----------------+-----+
-        |S    |pysam.CSOFT_CLIP|4    |
-        +-----+----------------+-----+
-        |H    |pysam.CHARD_CLIP|5    |
-        +-----+----------------+-----+
-        |P    |pysam.CPAD      |6    |
-        +-----+----------------+-----+
-        |=    |pysam.CEQUAL    |7    |
-        +-----+----------------+-----+
-        |X    |pysam.CDIFF     |8    |
-        +-----+----------------+-----+
-        |B    |pysam.CBACK     |9    |
-        +-----+----------------+-----+
+        +-----+--------------------------+-----+
+        |M    |pysam.CIGAR_OPS.CMATCH    |0    |
+        +-----+--------------------------+-----+
+        |I    |pysam.CIGAR_OPS.CINS      |1    |
+        +-----+--------------------------+-----+
+        |D    |pysam.CIGAR_OPS.CDEL      |2    |
+        +-----+--------------------------+-----+
+        |N    |pysam.CIGAR_OPS.CREF_SKIP |3    |
+        +-----+--------------------------+-----+
+        |S    |pysam.CIGAR_OPS.CSOFT_CLIP|4    |
+        +-----+--------------------------+-----+
+        |H    |pysam.CIGAR_OPS.CHARD_CLIP|5    |
+        +-----+--------------------------+-----+
+        |P    |pysam.CIGAR_OPS.CPAD      |6    |
+        +-----+--------------------------+-----+
+        |=    |pysam.CIGAR_OPS.CEQUAL    |7    |
+        +-----+--------------------------+-----+
+        |X    |pysam.CIGAR_OPS.CDIFF     |8    |
+        +-----+--------------------------+-----+
+        |B    |pysam.CIGAR_OPS.CBACK     |9    |
+        +-----+--------------------------+-----+
 
         .. note::
             The output is a list of (operation, length) tuples, such as
@@ -2776,11 +2866,11 @@ cdef class AlignedSegment:
         def __set__(self, v):
             self.query_sequence = v
     property qual:
-        """deprecated, use :attr:`query_qualities` instead."""
+        """deprecated, use :attr:`query_qualities` or :attr:`query_qualities_str` instead."""
         def __get__(self):
-            return array_to_qualitystring(self.query_qualities)
+            return self.query_qualities_str
         def __set__(self, v):
-            self.query_qualities = qualitystring_to_array(v)
+            self.query_qualities_str = v
     property alen:
         """deprecated, use :attr:`reference_length` instead."""
         def __get__(self):
@@ -2804,34 +2894,24 @@ cdef class AlignedSegment:
         instead."""
         def __get__(self):
             return self.query_alignment_sequence
-        def __set__(self, v):
-            self.query_alignment_sequence = v
     property qqual:
-        """deprecated, use :attr:`query_alignment_qualities` 
+        """deprecated, use :attr:`query_alignment_qualities` or :attr:`query_alignment_qualities_str`
         instead."""
         def __get__(self):
-            return array_to_qualitystring(self.query_alignment_qualities)
-        def __set__(self, v):
-            self.query_alignment_qualities = qualitystring_to_array(v)
+            return self.query_alignment_qualities_str
     property qstart:
         """deprecated, use :attr:`query_alignment_start` instead."""
         def __get__(self):
             return self.query_alignment_start
-        def __set__(self, v):
-            self.query_alignment_start = v
     property qend:
         """deprecated, use :attr:`query_alignment_end` instead."""
         def __get__(self):
             return self.query_alignment_end
-        def __set__(self, v):
-            self.query_alignment_end = v
     property qlen:
         """deprecated, use :attr:`query_alignment_length` 
         instead."""
         def __get__(self):
             return self.query_alignment_length
-        def __set__(self, v):
-            self.query_alignment_length = v
     property mrnm:
         """deprecated, use :attr:`next_reference_id` instead."""
         def __get__(self):
@@ -3391,10 +3471,16 @@ cpdef enum SAM_FLAGS:
     FSUPPLEMENTARY = 2048
 
 
+# TODO Remove these and remove the enumerators from __all__
+globals().update(getattr(CIGAR_OPS, "__members__"))
+globals().update(getattr(SAM_FLAGS, "__members__"))
+
+
 __all__ = [
     "AlignedSegment",
     "PileupColumn",
     "PileupRead",
+    "CIGAR_OPS",
     "CMATCH",
     "CINS",
     "CDEL",
@@ -3405,6 +3491,7 @@ __all__ = [
     "CEQUAL",
     "CDIFF",
     "CBACK",
+    "SAM_FLAGS",
     "FPAIRED",
     "FPROPER_PAIR",
     "FUNMAP",

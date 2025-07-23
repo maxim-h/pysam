@@ -1665,8 +1665,7 @@ cdef class AlignmentFile(HTSFile):
         and their support ( = number of reads ).
 
         read_iterator can be the result of a .fetch(...) call.
-        Or it can be a generator filtering such reads. Example
-        samfile.find_introns((read for read in samfile.fetch(...) if read.is_reverse)
+        Or it can be a generator filtering such reads.
         """
         cdef:
             int32_t base_position, junc_start, nt
@@ -1685,7 +1684,13 @@ cdef class AlignmentFile(HTSFile):
             not_start = False
             base_position = r.pos
             cigar = r.cigartuples
-            if cigar is None or not r.has_tag(sam_options['CB']) or ((sam_options['UMI'] is not None) and (not r.has_tag(sam_options['UMI']))) or r.is_secondary or (forward_strand == r.is_reverse):
+            # Filter out reads if
+            if (cigar is None or # no CIGAR
+                not r.has_tag(sam_options['CB']) or # No cell barcode
+                ((sam_options['UMI'] is not None) and # UMI tag expected, but not found
+                    (not r.has_tag(sam_options['UMI']))) or
+                r.is_secondary or # Secondary alignment
+                (forward_strand == r.is_reverse)): # Wrong strand. TODO: only works with  default reverse strandedness of 10x.
                 continue
 
             if sam_options['UMI'] is None:

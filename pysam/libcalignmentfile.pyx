@@ -1664,7 +1664,7 @@ cdef class AlignmentFile(HTSFile):
         return res
 
 
-    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_partner = False):
+    def count_junction(self, read_iterator, donor_site, acceptor_site, forward_strand, strandedness = "sense", sam_options = {"CB": "CB", "UMI": "UB"}, etype = "A3SS", no_match_splice_partner = False):
         """Return a dictionary {CellBarcode: {UMIs}}
         Listing the splice sites in the reads (identified by 'N' in the cigar strings),
         and their support ( = number of reads ).
@@ -1687,6 +1687,9 @@ cdef class AlignmentFile(HTSFile):
 
         match_or_deletion = {0, 2, 7, 8} # only M/=/X (0/7/8) and D (2) are related to genome position
 
+        if (strandedness is not None) and (strandedness not in {"sense", "antisense"}):
+            raise AssertionError("strandedness can only be None, 'sense' or 'antisense'")
+
         no_match_donor_site = (etype == "A3SS") and no_match_splice_partner
         no_match_acceptor_site = (etype == "A5SS") and no_match_splice_partner
         if no_match_donor_site and no_match_acceptor_site:
@@ -1703,8 +1706,9 @@ cdef class AlignmentFile(HTSFile):
                     or ((sam_options['UMI'] is not None) # UMI tag expected, but not found
                         and (not r.has_tag(sam_options['UMI'])))
                     or r.is_secondary # Secondary alignment
-                    #TODO: only works with  default reverse strandedness of 10x.
-                    or (forward_strand == r.is_reverse)): # Wrong strand.
+                    #TODO: Double check the logic
+                    or ((strandedness is not None) # Wrong strand.
+                        and ((strandedness == "antisense") != (forward_strand == r.is_reverse)))):
                 continue
 
             if sam_options['UMI'] is None:

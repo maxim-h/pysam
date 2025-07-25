@@ -167,6 +167,7 @@ class AlignmentFile(HTSFile):
         donor_site: int,
         acceptor_site: int,
         forward_strand: bool,
+        strandedness: Optional[str],
         sam_options: dict,
         etype: str,
         no_match_splice_partner: bool
